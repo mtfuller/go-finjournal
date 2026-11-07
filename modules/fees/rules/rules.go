@@ -4,6 +4,7 @@ package rules
 
 import (
 	"context"
+	"embed"
 	"fmt"
 	"strconv"
 	"strings"
@@ -15,6 +16,15 @@ import (
 	"github.com/mtfuller/go-finjournal/pkg/money"
 	"github.com/mtfuller/go-finjournal/pkg/module"
 )
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+func init() {
+	module.Register("fees/rules", func() (module.Module, error) {
+		return New(Config{})
+	})
+}
 
 // MatchCriteria defines when a Schedule applies to an Intent.
 type MatchCriteria struct {
@@ -83,6 +93,9 @@ func (m *Module) Name() string {
 
 func (m *Module) Init(ctx context.Context, h module.Host) error {
 	m.host = h
+	if err := h.Migrate(ctx, migrationsFS); err != nil {
+		return err
+	}
 	if len(m.cfg.Schedules) == 0 {
 		if err := h.DecodeConfig(&m.cfg); err != nil {
 			return err

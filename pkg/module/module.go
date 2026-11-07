@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/mtfuller/go-finjournal/pkg/core"
@@ -15,6 +17,42 @@ import (
 	"github.com/mtfuller/go-finjournal/pkg/money"
 	"github.com/mtfuller/go-finjournal/pkg/storage"
 )
+
+// Factory constructs a new instance of a registered Module.
+type Factory func() (Module, error)
+
+var (
+	registryMu sync.RWMutex
+	registry   = make(map[string]Factory)
+)
+
+// Register registers a module Factory by name so custom binaries built with xfinjournald
+// can discover and instantiate third-party modules from init() functions.
+func Register(name string, f Factory) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	registry[name] = f
+}
+
+// Lookup returns a registered module Factory by name.
+func Lookup(name string) (Factory, bool) {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	f, ok := registry[name]
+	return f, ok
+}
+
+// RegisteredNames returns all registered module names in sorted order.
+func RegisteredNames() []string {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	names := make([]string, 0, len(registry))
+	for k := range registry {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
+}
 
 // Module is the base interface implemented by every ledger module.
 type Module interface {

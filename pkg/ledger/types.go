@@ -28,9 +28,11 @@ type (
 	Intent          = core.Intent
 	HolderBalance   = core.HolderBalance
 	Period          = core.Period
-	JournalRecord   = core.JournalRecord
-	Checkpoint      = core.Checkpoint
-	Error           = core.Error
+	JournalRecord        = core.JournalRecord
+	Checkpoint           = core.Checkpoint
+	AccrualSettleRequest = core.AccrualSettleRequest
+	AccrualSettleResult  = core.AccrualSettleResult
+	Error                = core.Error
 	Clock           = core.Clock
 	RealClock       = core.RealClock
 	ManualClock     = core.ManualClock

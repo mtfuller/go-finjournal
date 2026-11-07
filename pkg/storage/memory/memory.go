@@ -67,6 +67,8 @@ type Store struct {
 	sealedTxs     map[core.TransactionID]bool
 	checkpoints   map[core.LedgerID][]core.Checkpoint
 	periods       map[core.LedgerID][]core.Period
+	modMigrations map[string]bool
+	advisoryLocks map[string]bool
 
 	// Fault injection state
 	faultMu          sync.Mutex
@@ -95,6 +97,8 @@ func New() *Store {
 		sealedTxs:     make(map[core.TransactionID]bool),
 		checkpoints:   make(map[core.LedgerID][]core.Checkpoint),
 		periods:       make(map[core.LedgerID][]core.Period),
+		modMigrations: make(map[string]bool),
+		advisoryLocks: make(map[string]bool),
 		failNext:      make(map[string]error),
 		delays:        make(map[string]time.Duration),
 	}
@@ -530,6 +534,13 @@ func (s *Store) PruneIdempotency(_ context.Context, before time.Time) (int, erro
 	return pruned, nil
 }
 
+func (s *Store) ExecModuleMigration(_ context.Context, moduleName, migrationID, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.modMigrations[moduleName+":"+migrationID] = true
+	return nil
+}
+
 // --- Reader methods ---
 
 func (s *Store) Ledger(_ context.Context, id core.LedgerID) (*core.Ledger, error) {
@@ -957,6 +968,24 @@ func (s *Store) PruneDelivered(_ context.Context, before time.Time) (int, error)
 }
 
 // --- Journal methods ---
+
+func (s *Store) TryAdvisoryLock(_ context.Context, lockKey string) (func(), bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.advisoryLocks[lockKey] {
+		return nil, false, nil
+	}
+	s.advisoryLocks[lockKey] = true
+	var once sync.Once
+	unlock := func() {
+		once.Do(func() {
+			s.mu.Lock()
+			delete(s.advisoryLocks, lockKey)
+			s.mu.Unlock()
+		})
+	}
+	return unlock, true, nil
+}
 
 func (s *Store) UnsealedTransactions(_ context.Context, l core.LedgerID, limit int) ([]*core.Transaction, error) {
 	s.mu.RLock()

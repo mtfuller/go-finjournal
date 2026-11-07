@@ -6,6 +6,7 @@ package recon
 
 import (
 	"context"
+	"embed"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,15 @@ import (
 	"github.com/mtfuller/go-finjournal/pkg/money"
 	"github.com/mtfuller/go-finjournal/pkg/module"
 )
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+func init() {
+	module.Register("recon", func() (module.Module, error) {
+		return New(), nil
+	})
+}
 
 // Status represents the reconciliation status of an external statement item.
 type Status string
@@ -98,9 +108,9 @@ func (m *Module) Name() string {
 	return "recon"
 }
 
-func (m *Module) Init(_ context.Context, h module.Host) error {
+func (m *Module) Init(ctx context.Context, h module.Host) error {
 	m.host = h
-	return nil
+	return h.Migrate(ctx, migrationsFS)
 }
 
 func (m *Module) Close(_ context.Context) error {
@@ -167,6 +177,25 @@ func (m *Module) Handle(ctx context.Context, evs []events.Event) error {
 		m.mu.Unlock()
 	}
 	return nil
+}
+
+// ImportStatementCSV parses a CSV statement and returns the JSON-encoded results slice and the count of unmatched items.
+func (m *Module) ImportStatementCSV(ctx context.Context, source string, asset money.AssetID, r io.Reader) ([]byte, int, error) {
+	res, err := m.ImportCSV(ctx, source, asset, r)
+	if err != nil {
+		return nil, 0, err
+	}
+	unmatched := 0
+	for _, item := range res {
+		if item.Status != StatusMatched {
+			unmatched++
+		}
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		return nil, 0, err
+	}
+	return b, unmatched, nil
 }
 
 // ImportCSV parses a CSV statement with columns: id,reference,amount,value_date (RFC3339 or YYYY-MM-DD)

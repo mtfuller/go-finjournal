@@ -121,11 +121,12 @@ func ChainHash(prevChainHash []byte, seq uint64, txHash []byte) []byte {
 
 // SealerConfig configures the hash-chain sealer for a ledger.
 type SealerConfig struct {
-	CheckpointEvery uint64        // default 10,000 transactions
+	CheckpointEvery  uint64        // default 10,000 transactions
 	CheckpointMaxAge time.Duration // default 60s
-	BatchLimit      int           // default 500
-	Clock           core.Clock
-	IDGen           core.IDGenerator
+	LookbackWindow   time.Duration // default 10s (> 5s statement_timeout per RFC section 11)
+	BatchLimit       int           // default 500
+	Clock            core.Clock
+	IDGen            core.IDGenerator
 }
 
 // Sealer extends the tamper-evident hash chain for a ledger.
@@ -142,6 +143,9 @@ func NewSealer(store storage.Store, cfg SealerConfig) *Sealer {
 	}
 	if cfg.CheckpointMaxAge <= 0 {
 		cfg.CheckpointMaxAge = 60 * time.Second
+	}
+	if cfg.LookbackWindow <= 0 {
+		cfg.LookbackWindow = 10 * time.Second
 	}
 	if cfg.BatchLimit <= 0 {
 		cfg.BatchLimit = 500
@@ -161,8 +165,15 @@ func NewSealer(store storage.Store, cfg SealerConfig) *Sealer {
 
 // SealOnce seals up to BatchLimit unsealed transactions for ledger l,
 // creating a Checkpoint if CheckpointEvery or CheckpointMaxAge is reached.
+// It acquires a per-ledger advisory lock so only one leader replica seals at a time (RFC section 11).
 func (s *Sealer) SealOnce(ctx context.Context, l core.LedgerID) (int, *core.Checkpoint, error) {
 	j := s.store.Journal()
+	unlock, acquired, err := j.TryAdvisoryLock(ctx, "sealer:"+string(l))
+	if err != nil || !acquired {
+		return 0, nil, err
+	}
+	defer unlock()
+
 	unsealed, err := j.UnsealedTransactions(ctx, l, s.cfg.BatchLimit)
 	if err != nil || len(unsealed) == 0 {
 		return 0, nil, err

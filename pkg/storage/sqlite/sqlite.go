@@ -174,6 +174,13 @@ CREATE TABLE IF NOT EXISTS periods (
   PRIMARY KEY (ledger_id, starts_at)
 );
 
+CREATE TABLE IF NOT EXISTS module_migrations (
+  module        TEXT NOT NULL,
+  migration_id  TEXT NOT NULL,
+  applied_at    TEXT NOT NULL,
+  PRIMARY KEY (module, migration_id)
+);
+
 CREATE TRIGGER IF NOT EXISTS transactions_no_update BEFORE UPDATE ON transactions
 BEGIN SELECT RAISE(ABORT, 'ledger rows are immutable: UPDATE on transactions'); END;
 
@@ -200,9 +207,11 @@ func MigrationSQL() string {
 
 // Store is a SQLite-backed implementation of storage.Store.
 type Store struct {
-	db      *sql.DB
-	keepConn *sql.Conn // keeps shared in-memory DB alive across pool connections
-	writeMu sync.Mutex // SQLite has one writer per file
+	db            *sql.DB
+	keepConn      *sql.Conn // keeps shared in-memory DB alive across pool connections
+	writeMu       sync.Mutex // SQLite has one writer per file
+	advisoryMu    sync.Mutex
+	advisoryLocks map[string]bool
 }
 
 // Open opens a SQLite database at dsn (e.g., ":memory:" or a file path) and applies the schema.
@@ -666,6 +675,34 @@ func (s *Store) PruneIdempotency(ctx context.Context, before time.Time) (int, er
 	}
 	n, _ := res.RowsAffected()
 	return int(n), nil
+}
+
+func (s *Store) ExecModuleMigration(ctx context.Context, moduleName, migrationID, sqlText string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM module_migrations WHERE module = ? AND migration_id = ?`, moduleName, migrationID).Scan(&exists)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if strings.TrimSpace(sqlText) != "" {
+		if _, err := tx.ExecContext(ctx, sqlText); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO module_migrations (module, migration_id, applied_at) VALUES (?, ?, ?)`,
+		moduleName, migrationID, fmtTime(time.Now().UTC())); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // --- Reader methods ---
@@ -1235,6 +1272,27 @@ func (s *Store) PruneDelivered(ctx context.Context, before time.Time) (int, erro
 }
 
 // --- Journal methods ---
+
+func (s *Store) TryAdvisoryLock(_ context.Context, lockKey string) (func(), bool, error) {
+	s.advisoryMu.Lock()
+	defer s.advisoryMu.Unlock()
+	if s.advisoryLocks == nil {
+		s.advisoryLocks = make(map[string]bool)
+	}
+	if s.advisoryLocks[lockKey] {
+		return nil, false, nil
+	}
+	s.advisoryLocks[lockKey] = true
+	var once sync.Once
+	unlock := func() {
+		once.Do(func() {
+			s.advisoryMu.Lock()
+			delete(s.advisoryLocks, lockKey)
+			s.advisoryMu.Unlock()
+		})
+	}
+	return unlock, true, nil
+}
 
 func (s *Store) UnsealedTransactions(ctx context.Context, l core.LedgerID, limit int) ([]*core.Transaction, error) {
 	if limit <= 0 {

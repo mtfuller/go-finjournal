@@ -59,15 +59,13 @@ type AccountPatch struct {
 
 // BatchCommitItem describes one validated transaction to commit inside a batch.
 type BatchCommitItem struct {
-	Tx          *core.Transaction
-	Idem        IdemRecord
-	AccountDefs map[core.AccountID]core.Account
-	Events      []events.Event
-	// Optional hold settlement/void or reversal state updates
-	TargetTxID *core.TransactionID
-	Reversal   bool
-	SettleHold bool
-	VoidHold   bool
+	Op           uint8
+	Tx           *core.Transaction
+	RequestHash  []byte
+	AccountDefs  map[core.AccountID]core.Account
+	TargetTxID   *core.TransactionID
+	ReversalAmts []money.Amount
+	Events       []events.Event
 }
 
 // BatchCommitResult holds the per-item outcome of a batch commit.
@@ -137,7 +135,7 @@ type Reader interface {
 	Periods(ctx context.Context, l core.LedgerID) ([]core.Period, error)
 }
 
-// Admin provides DDL/setup operations for ledgers, assets, holders, accounts, and periods.
+// Admin provides DDL/setup operations for ledgers, assets, holders, accounts, periods, and module migrations.
 type Admin interface {
 	CreateLedger(ctx context.Context, l core.Ledger) error
 	RegisterAsset(ctx context.Context, l core.LedgerID, a money.Asset) error
@@ -147,6 +145,7 @@ type Admin interface {
 	CreatePeriod(ctx context.Context, p core.Period) error
 	ClosePeriod(ctx context.Context, l core.LedgerID, startsAt time.Time, closedAt time.Time) (*core.Period, error)
 	PruneIdempotency(ctx context.Context, before time.Time) (int, error)
+	ExecModuleMigration(ctx context.Context, moduleName, migrationID, sqlText string) error
 }
 
 // Outbox manages transactional outbox events and per-subscriber cursors.
@@ -160,6 +159,7 @@ type Outbox interface {
 
 // Journal manages the tamper-evident hash chain and checkpoints.
 type Journal interface {
+	TryAdvisoryLock(ctx context.Context, lockKey string) (unlock func(), acquired bool, err error)
 	UnsealedTransactions(ctx context.Context, l core.LedgerID, limit int) ([]*core.Transaction, error)
 	LatestRecord(ctx context.Context, l core.LedgerID) (*core.JournalRecord, error)
 	AppendRecords(ctx context.Context, records []core.JournalRecord, checkpoint *core.Checkpoint) error

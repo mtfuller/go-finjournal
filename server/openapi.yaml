@@ -208,9 +208,52 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Ledger'
         - { name: after, in: query, required: false, schema: { type: integer } }
+        - { name: wait, in: query, required: false, schema: { type: string, example: 500ms } }
       responses:
         '200':
           description: Events
+  /v1/ledgers/{ledger}/fx/quotes:
+    post:
+      operationId: createFXQuote
+      summary: Issue a two-step FX conversion quote (valid for 30s by default)
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [base, quote]
+              properties:
+                base: { type: string, example: USD/2 }
+                quote: { type: string, example: EUR/2 }
+                ttl_seconds: { type: integer, example: 30 }
+      responses:
+        '201':
+          description: Quote issued
+  /v1/ledgers/{ledger}/recon/statements:
+    post:
+      operationId: importReconStatement
+      summary: Import a bank or processor statement for reconciliation
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source, asset, csv]
+              properties:
+                source: { type: string, example: "bank:operating-usd" }
+                asset: { type: string, example: USD/2 }
+                csv: { type: string }
+      responses:
+        '200':
+          description: Reconciliation results
   /v1/ledgers/{ledger}/journal/checkpoints:
     get:
       operationId: getCheckpoints

@@ -4,6 +4,7 @@ package static
 
 import (
 	"context"
+	"embed"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,6 +14,17 @@ import (
 	"github.com/mtfuller/go-finjournal/pkg/money"
 	"github.com/mtfuller/go-finjournal/pkg/module"
 )
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+func init() {
+	factory := func() (module.Module, error) {
+		return New(Config{})
+	}
+	module.Register("rates/static", factory)
+	module.Register("fx", factory)
+}
 
 // PairConfig defines a static FX rate and optional customer spread percentage.
 type PairConfig struct {
@@ -72,8 +84,11 @@ func (m *Module) Name() string {
 	return "fx"
 }
 
-func (m *Module) Init(_ context.Context, h module.Host) error {
+func (m *Module) Init(ctx context.Context, h module.Host) error {
 	m.host = h
+	if err := h.Migrate(ctx, migrationsFS); err != nil {
+		return err
+	}
 	if len(m.cfg.Pairs) == 0 {
 		if err := h.DecodeConfig(&m.cfg); err != nil {
 			return err
@@ -97,12 +112,20 @@ func (m *Module) Matches(kind string) bool {
 }
 
 // Quote issues and stores a Quote for base -> quote at time `at`.
-func (m *Module) Quote(_ context.Context, base, quote money.AssetID, at time.Time) (module.Quote, error) {
+func (m *Module) Quote(ctx context.Context, base, quote money.AssetID, at time.Time) (module.Quote, error) {
+	return m.CreateQuote(ctx, base, quote, at, m.cfg.QuoteTTL)
+}
+
+// CreateQuote issues and stores a Quote for base -> quote at time `at` with custom ttl.
+func (m *Module) CreateQuote(_ context.Context, base, quote money.AssetID, at time.Time, ttl time.Duration) (module.Quote, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp, ok := m.pairs[pairKey{base: base, quote: quote}]
 	if !ok {
 		return module.Quote{}, fmt.Errorf("no static rate for %s -> %s", base, quote)
+	}
+	if ttl <= 0 {
+		ttl = m.cfg.QuoteTTL
 	}
 	m.qSeq++
 	id := fmt.Sprintf("q_%06d", m.qSeq)
@@ -114,7 +137,7 @@ func (m *Module) Quote(_ context.Context, base, quote money.AssetID, at time.Tim
 		Customer:   cp.customer,
 		Source:     cp.source,
 		ObservedAt: at.UTC(),
-		ExpiresAt:  at.UTC().Add(m.cfg.QuoteTTL),
+		ExpiresAt:  at.UTC().Add(ttl),
 	}
 	m.quotes[id] = q
 	return q, nil

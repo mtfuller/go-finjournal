@@ -1,0 +1,73 @@
+{
+  "title": "go-finjournal Operational Dashboard",
+  "uid": "go-finjournal-v1",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Transactions Committed vs Rejected Rate (TPS)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(ledger_transactions_total{result=\"committed\"}[1m])",
+          "legendFormat": "committed/s"
+        },
+        {
+          "expr": "rate(ledger_transactions_total{result=\"rejected\"}[1m])",
+          "legendFormat": "rejected/s"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Pipeline Stage Latency (Microseconds/s)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(ledger_stage_duration_microseconds_total{stage=\"enrich\"}[1m])",
+          "legendFormat": "enrich"
+        },
+        {
+          "expr": "rate(ledger_stage_duration_microseconds_total{stage=\"validate\"}[1m])",
+          "legendFormat": "validate"
+        },
+        {
+          "expr": "rate(ledger_stage_duration_microseconds_total{stage=\"commit\"}[1m])",
+          "legendFormat": "commit"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Module Hook Duration & Invocation Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(ledger_module_duration_microseconds_total[1m]) / clamp_min(rate(ledger_module_calls_total[1m]), 1)",
+          "legendFormat": "{{module}} avg µs"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Lock Timeouts, Rate Limits & Invariant Violations",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "ledger_lock_timeouts_total",
+          "legendFormat": "Lock Timeouts"
+        },
+        {
+          "expr": "ledger_rate_limited_total",
+          "legendFormat": "Rate Limited (429)"
+        },
+        {
+          "expr": "ledger_invariant_violations_total",
+          "legendFormat": "Invariant Violations (Must be 0)"
+        }
+      ]
+    }
+  ]
+}

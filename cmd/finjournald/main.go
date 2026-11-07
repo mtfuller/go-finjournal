@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -232,21 +231,16 @@ func openStore(ctx context.Context, cfg Config) (storage.Store, error) {
 			}
 			dsn = string(b)
 		}
-		db, err := sql.Open("postgres", dsn)
-		if err != nil {
-			return nil, err
-		}
-		if err := postgres.Migrate(ctx, db); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-		return postgres.New(db), nil
+		return postgres.Open(ctx, dsn)
 	default:
 		return nil, fmt.Errorf("unsupported storage driver %q", cfg.Storage.Driver)
 	}
 }
 
 func instantiateOfficialModule(name string) (module.Module, error) {
+	if factory, ok := module.Lookup(name); ok {
+		return factory()
+	}
 	switch name {
 	case "fees/rules":
 		return rules.New(rules.Config{})

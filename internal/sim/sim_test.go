@@ -22,4 +22,11 @@ func TestDeterministicSimulation(t *testing.T) {
 			t.Fatalf("simulation failed (reproduce with: go test ./internal/sim -seed=%d): %v", seed, err)
 		}
 	}
+
+	// Phase 3: also run 25 seeds with BatchedMode=true (StepMode BatchedCommitter with batch splits & faults)
+	for seed := int64(1); seed <= 25; seed++ {
+		if err := sim.RunSeed(sim.Config{Seed: seed, Steps: 30, BatchedMode: true}); err != nil {
+			t.Fatalf("batched simulation failed (seed=%d): %v", seed, err)
+		}
+	}
 }

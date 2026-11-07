@@ -12,6 +12,7 @@ import (
 	"path"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -120,6 +121,15 @@ func WithHookTimeouts(totalBudget, perModule time.Duration) Option {
 	}
 }
 
+// WithDeferredFoldInterval configures a background worker that folds Deferred account balances
+// across known ledgers every interval (e.g. 100ms per RFC section 6).
+func WithDeferredFoldInterval(interval time.Duration) Option {
+	return func(e *Engine) error {
+		e.deferredFoldInterval = interval
+		return nil
+	}
+}
+
 // PostOption configures a single Post, SettleHold, VoidHold, or Reverse call.
 type PostOption func(*postCallOptions)
 
@@ -151,8 +161,13 @@ type Engine struct {
 	idGen             IDGenerator
 	roundingMode      money.RoundingMode
 	logger            *slog.Logger
-	hookTotalTimeout  time.Duration
-	hookModuleTimeout time.Duration
+	hookTotalTimeout     time.Duration
+	hookModuleTimeout    time.Duration
+	deferredFoldInterval time.Duration
+	foldStopCh           chan struct{}
+	foldWG               sync.WaitGroup
+	knownLedgersMu       sync.RWMutex
+	knownLedgers         map[LedgerID]bool
 
 	modules         []module.Module
 	optionalModules map[string]bool
@@ -162,6 +177,7 @@ type Engine struct {
 	authorizers     []module.Authorizer
 	subscribers     []module.Subscriber
 	rateProviders   []module.RateProvider
+	telemetry       *engineTelemetry
 
 	cacheMu          sync.RWMutex
 	accountByIDCache map[AccountID]Account
@@ -179,13 +195,15 @@ func New(store storage.Store, opts ...Option) (*Engine, error) {
 		clock:             RealClock{},
 		idGen:             NewUUIDv7Generator(),
 		roundingMode:      money.HalfEven,
-		logger:            slog.Default(),
+		logger:            slog.New(NewRedactingHandler(slog.Default().Handler())),
 		hookTotalTimeout:  50 * time.Millisecond,
 		hookModuleTimeout: 20 * time.Millisecond,
 		optionalModules:   make(map[string]bool),
 		moduleConfigs:     make(map[string]any),
 		accountByIDCache:  make(map[AccountID]Account),
 		accountByCode:     make(map[string]AccountID),
+		knownLedgers:      make(map[LedgerID]bool),
+		telemetry:         newEngineTelemetry(),
 	}
 
 	for _, opt := range opts {
@@ -226,6 +244,12 @@ func New(store storage.Store, opts ...Option) (*Engine, error) {
 		}
 	}
 
+	if e.deferredFoldInterval > 0 {
+		e.foldStopCh = make(chan struct{})
+		e.foldWG.Add(1)
+		go e.deferredFoldLoop()
+	}
+
 	return e, nil
 }
 
@@ -244,8 +268,66 @@ func (e *Engine) RoundingMode() money.RoundingMode {
 	return e.roundingMode
 }
 
-// Close shuts down the committer and closes registered modules in reverse registration order.
+// Modules returns the registered modules on this engine.
+func (e *Engine) Modules() []module.Module {
+	out := make([]module.Module, len(e.modules))
+	copy(out, e.modules)
+	return out
+}
+
+// Metrics returns a point-in-time snapshot of engine telemetry counters and latencies.
+func (e *Engine) Metrics() MetricsSnapshot {
+	return e.telemetry.snapshot()
+}
+
+// QuoteFX requests a rate quote for (from, to) from the primary RateProvider module.
+// If the RateProvider supports two-step quote creation with a custom TTL (default 30s per RFC section 8),
+// it invokes CreateQuote; otherwise it falls back to Quote(ctx, from, to, now).
+func (e *Engine) QuoteFX(ctx context.Context, from, to money.AssetID, ttl time.Duration) (*module.Quote, error) {
+	if _, err := money.ParseAsset(from); err != nil {
+		return nil, NewError(CodeValidationFailed, fmt.Sprintf("invalid from_asset: %v", err), nil)
+	}
+	if _, err := money.ParseAsset(to); err != nil {
+		return nil, NewError(CodeValidationFailed, fmt.Sprintf("invalid to_asset: %v", err), nil)
+	}
+	if len(e.rateProviders) == 0 {
+		return nil, NewError(CodeModuleUnavailable, "no RateProvider module registered", nil)
+	}
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+	now := e.clock.Now()
+	rp := e.rateProviders[0]
+	type twoStepQuoter interface {
+		CreateQuote(ctx context.Context, from, to money.AssetID, at time.Time, ttl time.Duration) (module.Quote, error)
+	}
+	if tsq, ok := rp.(twoStepQuoter); ok {
+		q, err := tsq.CreateQuote(ctx, from, to, now, ttl)
+		if err != nil {
+			return nil, NewError(CodeModuleUnavailable, err.Error(), nil)
+		}
+		return &q, nil
+	}
+	q, err := rp.Quote(ctx, from, to, now)
+	if err != nil {
+		return nil, NewError(CodeModuleUnavailable, err.Error(), nil)
+	}
+	if q.ExpiresAt.IsZero() {
+		q.ExpiresAt = now.Add(ttl)
+	}
+	return &q, nil
+}
+
+// Close shuts down the committer, stops background workers, and closes registered modules in reverse registration order.
 func (e *Engine) Close(ctx context.Context) error {
+	if e.foldStopCh != nil {
+		select {
+		case <-e.foldStopCh:
+		default:
+			close(e.foldStopCh)
+		}
+		e.foldWG.Wait()
+	}
 	var firstErr error
 	if err := e.committer.Close(); err != nil && firstErr == nil {
 		firstErr = err
@@ -256,6 +338,45 @@ func (e *Engine) Close(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+func (e *Engine) trackLedger(l LedgerID) {
+	if l == "" {
+		return
+	}
+	e.knownLedgersMu.RLock()
+	exists := e.knownLedgers[l]
+	e.knownLedgersMu.RUnlock()
+	if exists {
+		return
+	}
+	e.knownLedgersMu.Lock()
+	e.knownLedgers[l] = true
+	e.knownLedgersMu.Unlock()
+}
+
+func (e *Engine) deferredFoldLoop() {
+	defer e.foldWG.Done()
+	ticker := time.NewTicker(e.deferredFoldInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.foldStopCh:
+			return
+		case <-ticker.C:
+			e.knownLedgersMu.RLock()
+			ledgers := make([]LedgerID, 0, len(e.knownLedgers))
+			for l := range e.knownLedgers {
+				ledgers = append(ledgers, l)
+			}
+			e.knownLedgersMu.RUnlock()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			for _, l := range ledgers {
+				_, _ = e.store.FoldDeferredBalances(ctx, l)
+			}
+			cancel()
+		}
+	}
 }
 
 // --- Admin & Setup helpers ---
@@ -277,6 +398,7 @@ func (e *Engine) CreateLedger(ctx context.Context, id LedgerID, name string, met
 	if err := e.store.Admin().CreateLedger(ctx, l); err != nil {
 		return nil, mapStorageErr(err)
 	}
+	e.trackLedger(id)
 	return &l, nil
 }
 
@@ -290,7 +412,56 @@ func (e *Engine) RegisterAsset(ctx context.Context, l LedgerID, code string, sca
 	if err := e.store.Admin().RegisterAsset(ctx, l, a); err != nil {
 		return nil, mapStorageErr(err)
 	}
+	// Automatically create Deferred-mode system rounding account for the asset (RFC Section 7)
+	roundingCode := "system:rounding:" + assetCodeSlug(a)
+	_, _ = e.ensureSystemAccount(ctx, l, roundingCode, a.ID(), Deferred, "core")
 	return &a, nil
+}
+
+func assetCodeSlug(a money.Asset) string {
+	low := strings.ToLower(a.Code)
+	return fmt.Sprintf("%s_%d", low, a.Scale)
+}
+
+func (e *Engine) ensureSystemAccount(
+	ctx context.Context,
+	l LedgerID,
+	code string,
+	asset money.AssetID,
+	mode BalanceMode,
+	modName string,
+) (AccountID, error) {
+	if existing, err := e.store.AccountByCode(ctx, l, code); err == nil && existing != nil {
+		return existing.ID, nil
+	}
+	if _, err := e.store.Ledger(ctx, l); errors.Is(err, storage.ErrNotFound) {
+		_, _ = e.CreateLedger(ctx, l, string(l), nil)
+	}
+	if _, err := e.store.Asset(ctx, l, asset); errors.Is(err, storage.ErrNotFound) {
+		if parsed, pErr := money.ParseAsset(asset); pErr == nil {
+			_ = e.store.Admin().RegisterAsset(ctx, l, parsed)
+		}
+	}
+	now := e.clock.Now()
+	acct := Account{
+		ID:          AccountID(e.idGen.NewID(now)),
+		Ledger:      l,
+		Code:        code,
+		Asset:       asset,
+		Normal:      Credit,
+		BalanceMode: mode,
+		Status:      AccountOpen,
+		Metadata:    Metadata{"system": "true", "module": modName},
+		CreatedAt:   now,
+	}
+	if err := e.store.Admin().CreateAccount(ctx, acct); err != nil {
+		if existing, rErr := e.store.AccountByCode(ctx, l, code); rErr == nil && existing != nil {
+			return existing.ID, nil
+		}
+		return "", mapStorageErr(err)
+	}
+	e.invalidateAccountCache(acct.ID, acct.Ledger, acct.Code)
+	return acct.ID, nil
 }
 
 // CreateHolder creates an AccountHolder in a ledger.
@@ -412,6 +583,7 @@ func (e *Engine) Post(ctx context.Context, intent Intent, opts ...PostOption) (*
 	if intent.Ledger == "" {
 		return nil, NewError(CodeValidationFailed, "ledger is required", nil)
 	}
+	e.trackLedger(intent.Ledger)
 	if intent.Kind == "" {
 		return nil, NewError(CodeValidationFailed, "kind is required", nil)
 	}
@@ -478,6 +650,7 @@ func (e *Engine) Post(ctx context.Context, intent Intent, opts ...PostOption) (*
 	}
 
 	// Step 5: Enrich
+	enrichStart := time.Now()
 	draft := module.NewDraft(intent)
 	var extraEvents []events.Event
 	if len(e.enrichers) > 0 {
@@ -510,40 +683,48 @@ func (e *Engine) Post(ctx context.Context, intent Intent, opts ...PostOption) (*
 					})
 					continue
 				}
+				e.telemetry.postsFailed.Add(1)
 				return nil, modErr
 			}
 		}
 		draft.SetCurrentModule("")
 	}
+	e.telemetry.enrichDurationMicros.Add(uint64(time.Since(enrichStart).Microseconds()))
 
 	// Resolve any account codes added by enrichers and re-run steps 3 & 4
 	finalPostings, err := e.resolvePostingAccounts(ctx, intent.Ledger, draft.Postings())
 	if err != nil {
+		e.telemetry.postsFailed.Add(1)
 		return nil, err
 	}
 	if len(finalPostings) < 1 || len(finalPostings) > core.MaxPostings {
+		e.telemetry.postsFailed.Add(1)
 		return nil, NewError(CodeValidationFailed,
 			fmt.Sprintf("transaction must have between 1 and %d postings (got %d)", core.MaxPostings, len(finalPostings)),
 			nil)
 	}
 	accountsMap, err := e.validateAndLoadAccounts(ctx, intent.Ledger, finalPostings)
 	if err != nil {
+		e.telemetry.postsFailed.Add(1)
 		return nil, err
 	}
 
 	finalMeta := draft.Metadata()
 	if err := finalMeta.Validate(); err != nil {
+		e.telemetry.postsFailed.Add(1)
 		return nil, err
 	}
 
 	// Step 1: Authorize (checked with full resolved account list)
 	if callOpts.principal != nil {
 		if err := e.authorize(ctx, *callOpts.principal, "tx:post", intent.Ledger, accountsMap); err != nil {
+			e.telemetry.postsFailed.Add(1)
 			return nil, err
 		}
 	}
 
 	// Step 6: Validate (registered Validator modules)
+	validateStart := time.Now()
 	for _, val := range e.validators {
 		draft.SetCurrentModule(val.Name())
 		valErr := e.runSyncHook(ctx, val.Name(), func(mCtx context.Context) error {
@@ -553,9 +734,11 @@ func (e *Engine) Post(ctx context.Context, intent Intent, opts ...PostOption) (*
 			if e.optionalModules[val.Name()] {
 				continue
 			}
+			e.telemetry.postsFailed.Add(1)
 			return nil, valErr
 		}
 	}
+	e.telemetry.validateDurationMicros.Add(uint64(time.Since(validateStart).Microseconds()))
 
 	status := StatusPosted
 	if intent.Pending {
@@ -575,6 +758,7 @@ func (e *Engine) Post(ctx context.Context, intent Intent, opts ...PostOption) (*
 	}
 
 	// Steps 7–10: Critical section via Committer
+	commitStart := time.Now()
 	committed, err := e.committer.Commit(ctx, commit.CommitRequest{
 		Op:          commit.OpPost,
 		Tx:          tx,
@@ -584,9 +768,12 @@ func (e *Engine) Post(ctx context.Context, intent Intent, opts ...PostOption) (*
 		ExternalTx:  callOpts.externalTx,
 		EventID:     e.idGen.NewID(now),
 	})
+	e.telemetry.commitDurationMicros.Add(uint64(time.Since(commitStart).Microseconds()))
 	if err != nil {
+		e.telemetry.postsFailed.Add(1)
 		return nil, mapStorageErr(err)
 	}
+	e.telemetry.postsCommitted.Add(1)
 	return committed, nil
 }
 
@@ -917,6 +1104,184 @@ func (e *Engine) Reverse(
 	return committed, nil
 }
 
+// SettleAccrual converts an accrued balance from a higher-precision asset (e.g. USD/6) to a
+// coarser payable asset of the same currency (e.g. USD/2) using FX position accounts at a rate of 1,
+// either routing the remainder to system:rounding:<asset> or carrying it forward in FromAccount (RFC Section 7).
+func (e *Engine) SettleAccrual(ctx context.Context, req AccrualSettleRequest, opts ...PostOption) (*AccrualSettleResult, error) {
+	if req.Ledger == "" || req.IdempotencyKey == "" || req.FromAccount == "" || req.ToAccount == "" {
+		return nil, NewError(CodeValidationFailed, "ledger, idempotency_key, from_account, and to_account are required", nil)
+	}
+	fromID, err := e.resolveAccountID(ctx, req.Ledger, string(req.FromAccount))
+	if err != nil {
+		return nil, err
+	}
+	toID, err := e.resolveAccountID(ctx, req.Ledger, string(req.ToAccount))
+	if err != nil {
+		return nil, err
+	}
+	accts, err := e.store.Accounts(ctx, []AccountID{fromID, toID})
+	if err != nil {
+		return nil, mapStorageErr(err)
+	}
+	var fromAcct, toAcct Account
+	for _, a := range accts {
+		if a.ID == fromID {
+			fromAcct = a
+		}
+		if a.ID == toID {
+			toAcct = a
+		}
+	}
+	fromAsset, err := money.ParseAsset(fromAcct.Asset)
+	if err != nil {
+		return nil, NewError(CodeValidationFailed, err.Error(), nil)
+	}
+	toAsset, err := money.ParseAsset(toAcct.Asset)
+	if err != nil {
+		return nil, NewError(CodeValidationFailed, err.Error(), nil)
+	}
+	if fromAsset.Code != toAsset.Code {
+		return nil, NewError(CodeValidationFailed,
+			fmt.Sprintf("SettleAccrual requires same currency code (%s vs %s)", fromAsset.Code, toAsset.Code), nil)
+	}
+	if fromAsset.Scale <= toAsset.Scale {
+		return nil, NewError(CodeValidationFailed,
+			fmt.Sprintf("accrual asset scale (%d) must be greater than payable asset scale (%d)", fromAsset.Scale, toAsset.Scale), nil)
+	}
+
+	var grossAmt money.Amount
+	if req.Amount != nil {
+		grossAmt = *req.Amount
+	} else {
+		bal, err := e.store.Balance(ctx, fromID)
+		if err != nil {
+			return nil, mapStorageErr(err)
+		}
+		grossAmt = bal.Posted(fromAcct.Normal)
+	}
+	if !grossAmt.IsPositive() {
+		return nil, NewError(CodeValidationFailed, "accrual amount to settle must be positive", nil)
+	}
+
+	mode := e.roundingMode
+	if req.RoundingMode != nil {
+		mode = *req.RoundingMode
+	}
+	payableAmt, remAmt, err := money.Rescale(grossAmt, fromAsset.Scale, toAsset.Scale, mode)
+	if err != nil {
+		return nil, NewError(CodeValidationFailed, err.Error(), nil)
+	}
+
+	posFromCode := "system:fx:position:" + assetCodeSlug(fromAsset)
+	posFromID, err := e.ensureSystemAccount(ctx, req.Ledger, posFromCode, fromAcct.Asset, Deferred, "core")
+	if err != nil {
+		return nil, err
+	}
+	posToCode := "system:fx:position:" + assetCodeSlug(toAsset)
+	posToID, err := e.ensureSystemAccount(ctx, req.Ledger, posToCode, toAcct.Asset, Deferred, "core")
+	if err != nil {
+		return nil, err
+	}
+
+	var postings []Posting
+	if req.CarryForward {
+		settledHighAmt, err := grossAmt.Sub(remAmt)
+		if err != nil {
+			return nil, NewError(CodeValidationFailed, err.Error(), nil)
+		}
+		if settledHighAmt.IsPositive() {
+			postings = append(postings, Posting{
+				Debit:  fromID,
+				Credit: posFromID,
+				Amount: settledHighAmt,
+				Asset:  fromAcct.Asset,
+				Memo:   "accrual settlement (carry forward)",
+			})
+		}
+		if payableAmt.IsPositive() {
+			postings = append(postings, Posting{
+				Debit:  posToID,
+				Credit: toID,
+				Amount: payableAmt,
+				Asset:  toAcct.Asset,
+				Memo:   "accrual payout",
+			})
+		}
+	} else {
+		postings = append(postings, Posting{
+			Debit:  fromID,
+			Credit: posFromID,
+			Amount: grossAmt,
+			Asset:  fromAcct.Asset,
+			Memo:   "accrual settlement",
+		})
+		if payableAmt.IsPositive() {
+			postings = append(postings, Posting{
+				Debit:  posToID,
+				Credit: toID,
+				Amount: payableAmt,
+				Asset:  toAcct.Asset,
+				Memo:   "accrual payout",
+			})
+		}
+		if !remAmt.IsZero() {
+			roundingCode := "system:rounding:" + assetCodeSlug(fromAsset)
+			roundingID, err := e.ensureSystemAccount(ctx, req.Ledger, roundingCode, fromAcct.Asset, Deferred, "core")
+			if err != nil {
+				return nil, err
+			}
+			if remAmt.IsPositive() {
+				postings = append(postings, Posting{
+					Debit:  posFromID,
+					Credit: roundingID,
+					Amount: remAmt,
+					Asset:  fromAcct.Asset,
+					Memo:   "accrual rounding remainder",
+				})
+			} else {
+				absRem, _ := remAmt.Neg()
+				postings = append(postings, Posting{
+					Debit:  roundingID,
+					Credit: posFromID,
+					Amount: absRem,
+					Asset:  fromAcct.Asset,
+					Memo:   "accrual rounding remainder",
+				})
+			}
+		}
+	}
+	if len(postings) == 0 {
+		return nil, NewError(CodeValidationFailed, "accrual settlement produced no non-zero postings", nil)
+	}
+
+	meta := req.Metadata.Clone()
+	if meta == nil {
+		meta = make(Metadata)
+	}
+	meta["accrual.from_asset"] = string(fromAcct.Asset)
+	meta["accrual.to_asset"] = string(toAcct.Asset)
+	meta["accrual.payable_amount"] = payableAmt.String()
+	meta["accrual.remainder"] = remAmt.String()
+	meta["accrual.rounding_mode"] = mode.String()
+
+	tx, err := e.Post(ctx, Intent{
+		Ledger:         req.Ledger,
+		Kind:           "accrual_payout",
+		IdempotencyKey: req.IdempotencyKey,
+		Postings:       postings,
+		EffectiveAt:    req.EffectiveAt,
+		Metadata:       meta,
+	}, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &AccrualSettleResult{
+		Transaction:   tx,
+		PayableAmount: payableAmt,
+		Remainder:     remAmt,
+	}, nil
+}
+
 // HolderBalances returns per-asset totals across a holder's accounts, optionally converting
 // to reportIn (e.g. "USD/2") using the registered RateProvider's mid rate (RFC section 8).
 func (e *Engine) HolderBalances(ctx context.Context, h HolderID, reportIn money.AssetID) ([]HolderBalance, error) {
@@ -982,6 +1347,8 @@ func convertAmountWithRate(amt money.Amount, fromScale, toScale uint8, rate mone
 }
 
 // RelayOnce delivers pending outbox events to all registered Subscriber modules in commit order.
+// Subscriber failures are isolated: one slow or failing subscriber logs/records its error
+// without preventing other subscribers from advancing their cursors (RFC section 6).
 func (e *Engine) RelayOnce(ctx context.Context) (int, error) {
 	if len(e.subscribers) == 0 {
 		return 0, nil
@@ -989,15 +1356,18 @@ func (e *Engine) RelayOnce(ctx context.Context) (int, error) {
 	outbox := e.store.Outbox()
 	deliveredCount := 0
 	now := e.clock.Now()
+	var relayErrs []error
 
 	for _, sub := range e.subscribers {
 		cursor, err := outbox.GetCursor(ctx, sub.Name())
 		if err != nil {
-			return deliveredCount, err
+			relayErrs = append(relayErrs, fmt.Errorf("subscriber %s get cursor: %w", sub.Name(), err))
+			continue
 		}
 		evs, err := outbox.FetchAllAfter(ctx, cursor, 100)
 		if err != nil {
-			return deliveredCount, err
+			relayErrs = append(relayErrs, fmt.Errorf("subscriber %s fetch events: %w", sub.Name(), err))
+			continue
 		}
 		if len(evs) == 0 {
 			continue
@@ -1013,18 +1383,25 @@ func (e *Engine) RelayOnce(ctx context.Context) (int, error) {
 			}
 		}
 		if len(matching) > 0 {
-			if err := sub.Handle(ctx, matching); err != nil {
-				return deliveredCount, fmt.Errorf("subscriber %s failed: %w", sub.Name(), err)
+			start := time.Now()
+			err := sub.Handle(ctx, matching)
+			e.telemetry.recordModule(sub.Name(), time.Since(start))
+			if err != nil {
+				e.logger.WarnContext(ctx, "outbox subscriber delivery failed; cursor not advanced",
+					"subscriber", sub.Name(),
+					"error", err)
+				relayErrs = append(relayErrs, fmt.Errorf("subscriber %s failed: %w", sub.Name(), err))
+				continue
 			}
 			deliveredCount += len(matching)
 		}
 		if maxSeq > cursor {
 			if err := outbox.SetCursor(ctx, sub.Name(), maxSeq, now); err != nil {
-				return deliveredCount, err
+				relayErrs = append(relayErrs, fmt.Errorf("subscriber %s set cursor: %w", sub.Name(), err))
 			}
 		}
 	}
-	return deliveredCount, nil
+	return deliveredCount, errors.Join(relayErrs...)
 }
 
 // SealOnce runs one pass of the hash-chain sealer for ledger l.
@@ -1231,7 +1608,9 @@ func (e *Engine) runSyncHook(parentCtx context.Context, modName string, fn func(
 		}
 	}()
 
+	start := time.Now()
 	err := fn(ctx)
+	e.telemetry.recordModule(modName, time.Since(start))
 	if err == nil {
 		return nil
 	}
@@ -1375,7 +1754,33 @@ func (h *moduleHost) EnsureSystemAccount(
 	return acct.ID, nil
 }
 
-func (h *moduleHost) Migrate(_ context.Context, _ fs.FS) error {
+func (h *moduleHost) Migrate(ctx context.Context, migrations fs.FS) error {
+	if migrations == nil {
+		return nil
+	}
+	var files []string
+	err := fs.WalkDir(migrations, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && path.Ext(p) == ".sql" {
+			files = append(files, p)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	sort.Strings(files)
+	for _, f := range files {
+		data, err := fs.ReadFile(migrations, f)
+		if err != nil {
+			return err
+		}
+		if err := h.engine.store.Admin().ExecModuleMigration(ctx, h.modName, f, string(data)); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

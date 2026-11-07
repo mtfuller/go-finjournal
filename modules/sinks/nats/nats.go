@@ -12,6 +12,12 @@ import (
 	"github.com/mtfuller/go-finjournal/pkg/module"
 )
 
+func init() {
+	module.Register("sinks/nats", func() (module.Module, error) {
+		return New(Config{}, nil), nil
+	})
+}
+
 // Publisher abstracts a NATS JetStream connection for subject publishing with deduplication IDs.
 type Publisher interface {
 	PublishMsg(ctx context.Context, subject string, msgID string, data []byte) error

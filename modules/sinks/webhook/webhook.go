@@ -17,6 +17,12 @@ import (
 	"github.com/mtfuller/go-finjournal/pkg/module"
 )
 
+func init() {
+	module.Register("sinks/webhook", func() (module.Module, error) {
+		return New(Config{}, nil), nil
+	})
+}
+
 // Config configures the sinks/webhook module.
 type Config struct {
 	Endpoint string   `json:"endpoint" yaml:"endpoint"`

@@ -1,0 +1,10 @@
+go 1.24.0
+
+use (
+	.
+	./modules/fees/rules
+	./modules/rates/static
+	./modules/recon
+	./modules/sinks/nats
+	./modules/sinks/webhook
+)

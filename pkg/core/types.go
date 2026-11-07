@@ -465,6 +465,27 @@ type Checkpoint struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// AccrualSettleRequest describes a rescaling payout from a high-precision accrual
+// account (e.g. USD/6) to a coarser payable account (e.g. USD/2) per RFC Section 7.
+type AccrualSettleRequest struct {
+	Ledger         LedgerID            `json:"ledger"`
+	IdempotencyKey string              `json:"idempotency_key"`
+	FromAccount    AccountID           `json:"from_account"`    // accrual account or code (e.g. USD/6)
+	ToAccount      AccountID           `json:"to_account"`      // payable account or code (e.g. USD/2)
+	Amount         *money.Amount       `json:"amount,omitempty"` // nil means full posted balance of FromAccount
+	CarryForward   bool                `json:"carry_forward,omitempty"`
+	RoundingMode   *money.RoundingMode `json:"rounding_mode,omitempty"`
+	EffectiveAt    *time.Time          `json:"effective_at,omitempty"`
+	Metadata       Metadata            `json:"metadata,omitempty"`
+}
+
+// AccrualSettleResult holds the committed transaction and rescaled amounts.
+type AccrualSettleResult struct {
+	Transaction   *Transaction `json:"transaction"`
+	PayableAmount money.Amount `json:"payable_amount"`
+	Remainder     money.Amount `json:"remainder"`
+}
+
 // Error codes defined by RFC section 4 & 10.
 const (
 	CodeValidationFailed    = "validation_failed"

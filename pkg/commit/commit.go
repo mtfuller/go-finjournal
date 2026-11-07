@@ -292,6 +292,63 @@ func executeBatchInTx(
 ) ([]itemResult, error) {
 	results := make([]itemResult, len(reqs))
 
+	if externalTx == nil {
+		if bp := store.Batch(); bp != nil {
+			if len(reqs) > 1 {
+				batchCommitTime := time.Now().UTC()
+				for _, r := range reqs {
+					if r.Tx.CommittedAt.After(batchCommitTime) {
+						batchCommitTime = r.Tx.CommittedAt
+					}
+				}
+				for i := range reqs {
+					reqs[i].Tx.CommittedAt = batchCommitTime
+				}
+			}
+			items := make([]storage.BatchCommitItem, len(reqs))
+			for i, req := range reqs {
+				evs := make([]events.Event, 0, 1+len(req.ExtraEvents))
+				evs = append(evs, buildOutboxEvent(req))
+				evs = append(evs, req.ExtraEvents...)
+				var targetID *core.TransactionID
+				if req.TargetTx != nil {
+					id := req.TargetTx.ID
+					targetID = &id
+				}
+				items[i] = storage.BatchCommitItem{
+					Op:           uint8(req.Op),
+					Tx:           req.Tx,
+					RequestHash:  req.RequestHash,
+					AccountDefs:  req.Accounts,
+					TargetTxID:   targetID,
+					ReversalAmts: req.ReversalAmts,
+					Events:       evs,
+				}
+			}
+			batchRes, err := bp.PostBatch(ctx, items)
+			if err != nil {
+				return nil, err
+			}
+			for i, br := range batchRes {
+				if br.Err != nil {
+					results[i] = itemResult{err: br.Err}
+				} else {
+					tx := br.Tx
+					if tx == nil {
+						tx = reqs[i].Tx
+					}
+					if br.IdempotentReplay {
+						cp := *tx
+						cp.IdempotentReplay = true
+						tx = &cp
+					}
+					results[i] = itemResult{tx: tx}
+				}
+			}
+			return results, nil
+		}
+	}
+
 	var tx storage.Tx
 	var err error
 	if externalTx != nil {
@@ -373,6 +430,14 @@ func executeBatchInTx(
 	var validStates []storage.TxState
 	var validEvents []events.Event
 	modifiedBals := make(map[core.AccountID]bool)
+	batchCommitTime := time.Now().UTC()
+	if len(reqs) > 0 && !reqs[0].Tx.CommittedAt.IsZero() {
+		for _, r := range reqs {
+			if r.Tx.CommittedAt.After(batchCommitTime) {
+				batchCommitTime = r.Tx.CommittedAt
+			}
+		}
+	}
 
 	for i, req := range reqs {
 		ik := idemKey{ledger: req.Tx.Ledger, key: req.Tx.IdempotencyKey}
@@ -510,41 +575,23 @@ func executeBatchInTx(
 			continue
 		}
 
-		// Claim idempotency inside the DB transaction now that the intent passed all balance/limit checks
 		if req.Tx.IdempotencyKey != "" {
-			idemRec := storage.IdemRecord{
+			validIdem = append(validIdem, storage.IdemRecord{
 				Ledger:      req.Tx.Ledger,
 				Key:         req.Tx.IdempotencyKey,
 				RequestHash: req.RequestHash,
 				TxID:        req.Tx.ID,
 				CreatedAt:   req.Tx.CommittedAt,
-			}
-			existing, err := tx.ClaimIdempotency(ctx, []storage.IdemRecord{idemRec})
-			if err != nil {
-				return nil, err
-			}
-			if len(existing) > 0 {
-				ex := existing[0]
-				if !bytes.Equal(ex.RequestHash, req.RequestHash) {
-					results[i] = itemResult{
-						err: core.NewError(core.CodeIdempotencyConflict,
-							"idempotency key already used with different parameters",
-							map[string]any{"idempotency_key": req.Tx.IdempotencyKey}),
-					}
-					continue
-				}
-				storedTx, err := store.Transaction(ctx, ex.TxID)
-				if err != nil {
-					return nil, err
-				}
-				storedTx.IdempotentReplay = true
-				results[i] = itemResult{tx: storedTx}
-				continue
-			}
-			validIdem = append(validIdem, idemRec)
+			})
 		}
 
 		// Intent succeeded: promote working balances and state
+		if len(reqs) > 1 {
+			req.Tx.CommittedAt = batchCommitTime
+			for idx := range itemEntries {
+				itemEntries[idx].CommittedAt = batchCommitTime
+			}
+		}
 		for acctID, bal := range workBals {
 			balMap[acctID] = bal
 			modifiedBals[acctID] = true
@@ -573,6 +620,11 @@ func executeBatchInTx(
 	}
 
 	// 3. Write all valid rows in one batch to the storage transaction
+	if len(validIdem) > 0 {
+		if _, err := tx.ClaimIdempotency(ctx, validIdem); err != nil {
+			return nil, err
+		}
+	}
 	if len(validTxs) > 0 {
 		if err := tx.InsertTransactions(ctx, validTxs); err != nil {
 			return nil, err

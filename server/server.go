@@ -3,8 +3,11 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
@@ -12,11 +15,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/mtfuller/go-finjournal/pkg/events"
 	"github.com/mtfuller/go-finjournal/pkg/ledger"
 	"github.com/mtfuller/go-finjournal/pkg/money"
 	"github.com/mtfuller/go-finjournal/pkg/module"
@@ -46,7 +52,39 @@ type APIKeyConfig struct {
 
 // Config configures the HTTP Server.
 type Config struct {
-	APIKeys []APIKeyConfig `json:"api_keys" yaml:"api_keys"`
+	APIKeys        []APIKeyConfig `json:"api_keys" yaml:"api_keys"`
+	RateLimitRPS   int            `json:"rate_limit_rps,omitempty" yaml:"rate_limit_rps,omitempty"`     // per-key requests/sec (0 = unlimited)
+	RateLimitBurst int            `json:"rate_limit_burst,omitempty" yaml:"rate_limit_burst,omitempty"` // token bucket burst
+}
+
+// BuildTLSConfig constructs a TLS 1.3 configuration with optional mTLS client CA verification (RFC section 11).
+func BuildTLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("server: load TLS keypair: %w", err)
+	}
+	tlsCfg := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cert},
+	}
+	if clientCAFile != "" {
+		caPEM, err := os.ReadFile(clientCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("server: read client CA file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, errors.New("server: failed to parse client CA PEM")
+		}
+		tlsCfg.ClientCAs = pool
+		tlsCfg.ClientAuth = tls.VerifyClientCertIfGiven
+	}
+	return tlsCfg, nil
+}
+
+type tokenBucket struct {
+	tokens     int64 // scaled by 1000
+	lastRefill time.Time
 }
 
 type keyRecord struct {
@@ -56,26 +94,39 @@ type keyRecord struct {
 
 // Server wraps a ledger.Engine with REST v1 and operational HTTP handlers.
 type Server struct {
-	engine  *ledger.Engine
-	mux     *http.ServeMux
-	opsMux  *http.ServeMux
-	keys    []keyRecord
+	engine      *ledger.Engine
+	mux         *http.ServeMux
+	opsMux      *http.ServeMux
+	keys        []keyRecord
 	requireAuth bool
 
+	rateLimitRPS   int
+	rateLimitBurst int
+	rateMu         sync.Mutex
+	buckets        map[string]*tokenBucket
+
 	// Operational metrics counters
-	txCommittedTotal        atomic.Uint64
-	txRejectedTotal         atomic.Uint64
-	lockTimeoutsTotal       atomic.Uint64
+	txCommittedTotal         atomic.Uint64
+	txRejectedTotal          atomic.Uint64
+	lockTimeoutsTotal        atomic.Uint64
 	invariantViolationsTotal atomic.Uint64
+	rateLimitedTotal         atomic.Uint64
 }
 
 // New constructs a Server for engine.
 func New(engine *ledger.Engine, cfg Config) *Server {
+	burst := cfg.RateLimitBurst
+	if burst <= 0 && cfg.RateLimitRPS > 0 {
+		burst = cfg.RateLimitRPS
+	}
 	s := &Server{
-		engine:      engine,
-		mux:         http.NewServeMux(),
-		opsMux:      http.NewServeMux(),
-		requireAuth: len(cfg.APIKeys) > 0,
+		engine:         engine,
+		mux:            http.NewServeMux(),
+		opsMux:         http.NewServeMux(),
+		requireAuth:    len(cfg.APIKeys) > 0,
+		rateLimitRPS:   cfg.RateLimitRPS,
+		rateLimitBurst: burst,
+		buckets:        make(map[string]*tokenBucket),
 	}
 	for _, k := range cfg.APIKeys {
 		var h [32]byte
@@ -101,9 +152,26 @@ func New(engine *ledger.Engine, cfg Config) *Server {
 	return s
 }
 
-// Handler returns the main REST API http.Handler.
+// Handler returns the main REST API http.Handler with trace propagation middleware.
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := strings.TrimSpace(r.Header.Get("X-Trace-ID"))
+		if traceID == "" {
+			if tp := strings.TrimSpace(r.Header.Get("Traceparent")); tp != "" {
+				parts := strings.Split(tp, "-")
+				if len(parts) >= 2 {
+					traceID = parts[1]
+				} else {
+					traceID = tp
+				}
+			}
+		}
+		if traceID != "" {
+			w.Header().Set("X-Trace-ID", traceID)
+			r = r.WithContext(ledger.WithTraceID(r.Context(), traceID))
+		}
+		s.mux.ServeHTTP(w, r)
+	})
 }
 
 // OpsHandler returns the operational (/healthz, /readyz, /metrics) http.Handler.
@@ -131,6 +199,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/ledgers/{l}/transactions/{id}/void", s.handleVoidHold)
 	s.mux.HandleFunc("POST /v1/ledgers/{l}/transactions/{id}/reverse", s.handleReverseTransaction)
 	s.mux.HandleFunc("GET /v1/ledgers/{l}/events", s.handleGetEvents)
+	s.mux.HandleFunc("POST /v1/ledgers/{l}/fx/quotes", s.handleCreateFXQuote)
+	s.mux.HandleFunc("POST /v1/fx/quotes", s.handleCreateFXQuote)
+	s.mux.HandleFunc("POST /v1/ledgers/{l}/recon/statements", s.handleImportReconStatement)
+	s.mux.HandleFunc("POST /v1/recon/statements", s.handleImportReconStatement)
 	s.mux.HandleFunc("GET /v1/ledgers/{l}/journal/checkpoints", s.handleGetCheckpoints)
 	s.mux.HandleFunc("POST /v1/ledgers/{l}/periods/{start}/close", s.handleClosePeriod)
 
@@ -144,13 +216,50 @@ func (s *Server) registerRoutes() {
 
 // --- Auth & Request helpers ---
 
+func (s *Server) checkRateLimit(principalID string) error {
+	if s.rateLimitRPS <= 0 {
+		return nil
+	}
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	now := s.engine.Clock().Now()
+	maxTokens := int64(s.rateLimitBurst) * 1000
+	b, ok := s.buckets[principalID]
+	if !ok {
+		b = &tokenBucket{
+			tokens:     maxTokens,
+			lastRefill: now,
+		}
+		s.buckets[principalID] = b
+	}
+	elapsedMs := now.Sub(b.lastRefill).Milliseconds()
+	if elapsedMs > 0 {
+		refill := elapsedMs * int64(s.rateLimitRPS)
+		b.tokens += refill
+		if b.tokens > maxTokens {
+			b.tokens = maxTokens
+		}
+		b.lastRefill = now
+	}
+	if b.tokens < 1000 {
+		s.rateLimitedTotal.Add(1)
+		return ledger.NewError("rate_limited", "API key rate limit exceeded", nil)
+	}
+	b.tokens -= 1000
+	return nil
+}
+
 func (s *Server) authenticate(r *http.Request, requiredScope string, targetLedger ledger.LedgerID) (module.Principal, error) {
 	if !s.requireAuth {
-		return module.Principal{
+		p := module.Principal{
 			ID:      "anonymous",
 			Ledgers: []ledger.LedgerID{"*"},
 			Scopes:  []string{"*"},
-		}, nil
+		}
+		if err := s.checkRateLimit(p.ID); err != nil {
+			return module.Principal{}, err
+		}
+		return p, nil
 	}
 
 	// Check mTLS client certificate SAN first if present
@@ -162,6 +271,9 @@ func (s *Server) authenticate(r *http.Request, requiredScope string, targetLedge
 		}
 		for _, kr := range s.keys {
 			if kr.principal.ID == san {
+				if err := s.checkRateLimit(kr.principal.ID); err != nil {
+					return module.Principal{}, err
+				}
 				if err := ledger.DefaultAllow(kr.principal, requiredScope, module.Resource{Ledger: targetLedger}); err != nil {
 					return module.Principal{}, err
 				}
@@ -185,6 +297,9 @@ func (s *Server) authenticate(r *http.Request, requiredScope string, targetLedge
 	sum := sha256.Sum256([]byte(rawKey))
 	for _, kr := range s.keys {
 		if subtle.ConstantTimeCompare(sum[:], kr.hash[:]) == 1 {
+			if err := s.checkRateLimit(kr.principal.ID); err != nil {
+				return module.Principal{}, err
+			}
 			if err := ledger.DefaultAllow(kr.principal, requiredScope, module.Resource{Ledger: targetLedger}); err != nil {
 				return module.Principal{}, err
 			}
@@ -231,7 +346,11 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		} else {
 			s.txRejectedTotal.Add(1)
 		}
-		writeJSON(w, lErr.HTTPStatus(), lErr)
+		status := lErr.HTTPStatus()
+		if lErr.Code == "rate_limited" {
+			status = http.StatusTooManyRequests
+		}
+		writeJSON(w, status, lErr)
 		return
 	}
 	s.txRejectedTotal.Add(1)
@@ -636,25 +755,182 @@ func (s *Server) handleGetEvents(w http.ResponseWriter, r *http.Request) {
 	if aStr := r.URL.Query().Get("after"); aStr != "" {
 		after, _ = strconv.ParseUint(aStr, 10, 64)
 	}
-	evs, err := s.engine.Store().Outbox().FetchAfter(r.Context(), lID, after, 100)
+	var waitDur time.Duration
+	if wStr := r.URL.Query().Get("wait"); wStr != "" {
+		if parsed, err := time.ParseDuration(wStr); err == nil && parsed > 0 {
+			if parsed > 30*time.Second {
+				parsed = 30 * time.Second
+			}
+			waitDur = parsed
+		}
+	}
+
+	isSSE := strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+	if isSSE {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+
+		deadline := time.Now().Add(waitDur)
+		for {
+			evs, err := s.engine.Store().Outbox().FetchAfter(r.Context(), lID, after, 100)
+			if err != nil {
+				return
+			}
+			for _, ev := range evs {
+				b, _ := json.Marshal(ev)
+				_, _ = fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", ev.Seq, ev.Type, string(b))
+				if ev.Seq > after {
+					after = ev.Seq
+				}
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if waitDur == 0 || time.Now().After(deadline) {
+				return
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(15 * time.Millisecond):
+			}
+		}
+	}
+
+	deadline := time.Now().Add(waitDur)
+	for {
+		evs, err := s.engine.Store().Outbox().FetchAfter(r.Context(), lID, after, 100)
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
+		if len(evs) > 0 || waitDur == 0 || time.Now().After(deadline) {
+			writeJSON(w, http.StatusOK, map[string]any{"items": evs})
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			writeJSON(w, http.StatusOK, map[string]any{"items": []events.Event{}})
+			return
+		case <-time.After(15 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Server) handleCreateFXQuote(w http.ResponseWriter, r *http.Request) {
+	lID := ledger.LedgerID(r.PathValue("l"))
+	if lID == "" {
+		lID = "*"
+	}
+	if _, err := s.authenticate(r, "tx:post", lID); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if _, err := requireIdempotencyKey(r); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	var req struct {
+		Base       money.AssetID `json:"base"`
+		Quote      money.AssetID `json:"quote"`
+		TTLSeconds int           `json:"ttl_seconds"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	ttl := 30 * time.Second
+	if req.TTLSeconds > 0 {
+		ttl = time.Duration(req.TTLSeconds) * time.Second
+	}
+	q, err := s.engine.QuoteFX(r.Context(), req.Base, req.Quote, ttl)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(http.StatusOK)
-		for _, ev := range evs {
-			b, _ := json.Marshal(ev)
-			_, _ = fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", ev.Seq, ev.Type, string(b))
-		}
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":            q.ID,
+		"base":          q.Base,
+		"quote":         q.Quote,
+		"mid":           q.Mid.String(),
+		"customer_rate": q.Customer.String(),
+		"source":        q.Source,
+		"observed_at":   q.ObservedAt,
+		"expires_at":    q.ExpiresAt,
+	})
+}
+
+func (s *Server) handleImportReconStatement(w http.ResponseWriter, r *http.Request) {
+	lID := ledger.LedgerID(r.PathValue("l"))
+	if lID == "" {
+		lID = "*"
+	}
+	if _, err := s.authenticate(r, "admin", lID); err != nil {
+		s.writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": evs})
+	if _, err := requireIdempotencyKey(r); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	var req struct {
+		Ledger ledger.LedgerID `json:"ledger"`
+		Source string          `json:"source"`
+		Asset  money.AssetID   `json:"asset"`
+		CSV    string          `json:"csv"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if lID == "*" && req.Ledger != "" {
+		lID = req.Ledger
+	}
+	type statementImporter interface {
+		ImportStatementCSV(ctx context.Context, source string, asset money.AssetID, r io.Reader) ([]byte, int, error)
+	}
+	var importer statementImporter
+	for _, m := range s.engine.Modules() {
+		if imp, ok := m.(statementImporter); ok {
+			importer = imp
+			break
+		}
+	}
+	if importer == nil {
+		s.writeError(w, ledger.NewError(ledger.CodeModuleUnavailable, "recon module is not registered", nil))
+		return
+	}
+	resJSON, unmatchedCount, err := importer.ImportStatementCSV(r.Context(), req.Source, req.Asset, strings.NewReader(req.CSV))
+	if err != nil {
+		s.writeError(w, ledger.NewError(ledger.CodeValidationFailed, err.Error(), nil))
+		return
+	}
+	if unmatchedCount > 0 && lID != "" && lID != "*" {
+		if tx, txErr := s.engine.Store().Begin(r.Context()); txErr == nil {
+			now := s.engine.Clock().Now()
+			payload, _ := json.Marshal(map[string]any{
+				"source":          req.Source,
+				"asset":           req.Asset,
+				"unmatched_count": unmatchedCount,
+			})
+			_ = tx.AppendOutbox(r.Context(), []events.Event{{
+				ID:        fmt.Sprintf("recon_exc_%d", now.UnixNano()),
+				Ledger:    lID,
+				Type:      events.TypeReconException,
+				Payload:   payload,
+				CreatedAt: now,
+			}})
+			_ = tx.Commit(r.Context())
+		}
+	}
+	var parsedResults any
+	_ = json.Unmarshal(resJSON, &parsedResults)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"results":         parsedResults,
+		"unmatched_count": unmatchedCount,
+	})
 }
 
 func (s *Server) handleGetCheckpoints(w http.ResponseWriter, r *http.Request) {
@@ -707,12 +983,27 @@ func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	snap := s.engine.Metrics()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = fmt.Fprintf(w, "# TYPE ledger_transactions_total counter\n")
-	_, _ = fmt.Fprintf(w, "ledger_transactions_total{result=\"committed\"} %d\n", s.txCommittedTotal.Load())
-	_, _ = fmt.Fprintf(w, "ledger_transactions_total{result=\"rejected\"} %d\n", s.txRejectedTotal.Load())
+	_, _ = fmt.Fprintf(w, "ledger_transactions_total{result=\"committed\"} %d\n", s.txCommittedTotal.Load()+snap.PostsCommittedTotal)
+	_, _ = fmt.Fprintf(w, "ledger_transactions_total{result=\"rejected\"} %d\n", s.txRejectedTotal.Load()+snap.PostsFailedTotal)
 	_, _ = fmt.Fprintf(w, "# TYPE ledger_lock_timeouts_total counter\n")
 	_, _ = fmt.Fprintf(w, "ledger_lock_timeouts_total %d\n", s.lockTimeoutsTotal.Load())
 	_, _ = fmt.Fprintf(w, "# TYPE ledger_invariant_violations_total counter\n")
 	_, _ = fmt.Fprintf(w, "ledger_invariant_violations_total %d\n", s.invariantViolationsTotal.Load())
+	_, _ = fmt.Fprintf(w, "# TYPE ledger_rate_limited_total counter\n")
+	_, _ = fmt.Fprintf(w, "ledger_rate_limited_total %d\n", s.rateLimitedTotal.Load())
+	_, _ = fmt.Fprintf(w, "# TYPE ledger_stage_duration_microseconds_total counter\n")
+	_, _ = fmt.Fprintf(w, "ledger_stage_duration_microseconds_total{stage=\"enrich\"} %d\n", snap.EnrichDurationMicros)
+	_, _ = fmt.Fprintf(w, "ledger_stage_duration_microseconds_total{stage=\"validate\"} %d\n", snap.ValidateDurationMicros)
+	_, _ = fmt.Fprintf(w, "ledger_stage_duration_microseconds_total{stage=\"commit\"} %d\n", snap.CommitDurationMicros)
+	_, _ = fmt.Fprintf(w, "# TYPE ledger_module_calls_total counter\n")
+	for mod, count := range snap.ModuleCallsTotal {
+		_, _ = fmt.Fprintf(w, "ledger_module_calls_total{module=%q} %d\n", mod, count)
+	}
+	_, _ = fmt.Fprintf(w, "# TYPE ledger_module_duration_microseconds_total counter\n")
+	for mod, dur := range snap.ModuleDurationMicros {
+		_, _ = fmt.Fprintf(w, "ledger_module_duration_microseconds_total{module=%q} %d\n", mod, dur)
+	}
 }

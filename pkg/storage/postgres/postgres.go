@@ -1,11 +1,13 @@
-// Package postgres implements storage.Store backed by PostgreSQL, with embedded
-// SQL migrations and external transaction joining.
+// Package postgres implements storage.Store backed by PostgreSQL (pgx/v5 and database/sql),
+// with embedded SQL migrations, single-round-trip PL/pgSQL batch posting, and external
+// transaction joining (supporting both pgx.Tx and *sql.Tx).
 package postgres
 
 import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/mtfuller/go-finjournal/pkg/core"
 	"github.com/mtfuller/go-finjournal/pkg/events"
@@ -34,10 +40,60 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
+// MigratePool applies the embedded PostgreSQL migrations to a *pgxpool.Pool.
+func MigratePool(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, initMigrationSQL)
+	return err
+}
+
 // Store is a PostgreSQL-backed implementation of storage.Store.
 type Store struct {
 	db     *sql.DB
+	pool   *pgxpool.Pool
 	schema string
+}
+
+// Open connects to PostgreSQL via pgxpool, applies migrations, verifies schema version, and returns a Store.
+func Open(ctx context.Context, dsn string) (*Store, error) {
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := MigratePool(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	st := NewPool(pool)
+	if _, err := st.CheckSchemaVersion(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return st, nil
+}
+
+// ExpectedSchemaVersion is the current schema version required by this release of go-finjournal.
+const ExpectedSchemaVersion = 1
+
+// CheckSchemaVersion verifies that ledger.schema_meta matches ExpectedSchemaVersion (RFC Section 14).
+func (s *Store) CheckSchemaVersion(ctx context.Context) (int, error) {
+	var ver int
+	err := s.db.QueryRowContext(ctx, `SELECT schema_version FROM ledger.schema_meta WHERE id = 1`).Scan(&ver)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: check schema version: %w", err)
+	}
+	if ver != ExpectedSchemaVersion {
+		return ver, fmt.Errorf("postgres: schema version mismatch: got %d, expected %d", ver, ExpectedSchemaVersion)
+	}
+	return ver, nil
+}
+
+// NewPool creates a PostgreSQL Store backed by a *pgxpool.Pool.
+func NewPool(pool *pgxpool.Pool) *Store {
+	return &Store{
+		db:     stdlib.OpenDBFromPool(pool),
+		pool:   pool,
+		schema: "ledger",
+	}
 }
 
 // New creates a PostgreSQL Store using an existing *sql.DB connection pool.
@@ -48,31 +104,191 @@ func New(db *sql.DB) *Store {
 	}
 }
 
+// Pool returns the underlying *pgxpool.Pool if the Store was opened via Open or NewPool.
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
+// DB returns the underlying *sql.DB handle.
+func (s *Store) DB() *sql.DB { return s.db }
+
 func (s *Store) Admin() storage.Admin       { return s }
 func (s *Store) Outbox() storage.Outbox     { return s }
 func (s *Store) Journal() storage.Journal   { return s }
-func (s *Store) Batch() storage.BatchPoster { return nil }
-func (s *Store) Close() error               { return s.db.Close() }
+func (s *Store) Batch() storage.BatchPoster { return s }
+
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.pool != nil {
+		s.pool.Close()
+	}
+	return err
+}
+
+// PostBatch executes a batch of intents in a single network round-trip via ledger.post_batch(intents jsonb).
+func (s *Store) PostBatch(ctx context.Context, items []storage.BatchCommitItem) ([]storage.BatchCommitResult, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	type jsonBatchItem struct {
+		Op           uint8             `json:"op"`
+		Tx           *core.Transaction `json:"tx"`
+		RequestHash  string            `json:"request_hash"`
+		TargetTxID   string            `json:"target_tx_id,omitempty"`
+		ReversalAmts []string          `json:"reversal_amts,omitempty"`
+		Events       []events.Event    `json:"events"`
+	}
+	payloadItems := make([]jsonBatchItem, len(items))
+	for i, it := range items {
+		var targetID string
+		if it.TargetTxID != nil {
+			targetID = string(*it.TargetTxID)
+		}
+		var revAmts []string
+		if len(it.ReversalAmts) > 0 {
+			revAmts = make([]string, len(it.ReversalAmts))
+			for j, a := range it.ReversalAmts {
+				revAmts[j] = a.String()
+			}
+		}
+		payloadItems[i] = jsonBatchItem{
+			Op:           it.Op,
+			Tx:           it.Tx,
+			RequestHash:  hex.EncodeToString(it.RequestHash),
+			TargetTxID:   targetID,
+			ReversalAmts: revAmts,
+			Events:       it.Events,
+		}
+	}
+	batchJSON, err := json.Marshal(payloadItems)
+	if err != nil {
+		return nil, err
+	}
+
+	var respJSON []byte
+	err = s.db.QueryRowContext(ctx, `SELECT ledger.post_batch($1::jsonb)`, batchJSON).Scan(&respJSON)
+	if err != nil {
+		return nil, mapPgErr(err)
+	}
+
+	type jsonBatchResult struct {
+		OK               bool   `json:"ok"`
+		IdempotentReplay bool   `json:"idempotent_replay"`
+		TxID             string `json:"tx_id"`
+		ErrorCode        string `json:"error_code"`
+		Message          string `json:"message"`
+	}
+	var rawResults []jsonBatchResult
+	if err := json.Unmarshal(respJSON, &rawResults); err != nil {
+		return nil, err
+	}
+	if len(rawResults) != len(items) {
+		return nil, fmt.Errorf("postgres: post_batch returned %d results for %d items", len(rawResults), len(items))
+	}
+
+	out := make([]storage.BatchCommitResult, len(items))
+	for i, r := range rawResults {
+		if !r.OK {
+			code := r.ErrorCode
+			if code == "" {
+				code = core.CodeValidationFailed
+			}
+			out[i] = storage.BatchCommitResult{
+				Err: core.NewError(code, r.Message, nil),
+			}
+			continue
+		}
+		if r.IdempotentReplay {
+			storedTx, err := s.Transaction(ctx, core.TransactionID(r.TxID))
+			if err != nil {
+				return nil, err
+			}
+			storedTx.IdempotentReplay = true
+			out[i] = storage.BatchCommitResult{
+				Tx:               storedTx,
+				IdempotentReplay: true,
+			}
+			continue
+		}
+		out[i] = storage.BatchCommitResult{
+			Tx: items[i].Tx,
+		}
+	}
+	return out, nil
+}
 
 func (s *Store) Begin(ctx context.Context) (storage.Tx, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	return &pgTx{tx: tx, external: false}, nil
+	return &pgTx{runner: &sqlTxRunner{tx: tx}, external: false}, nil
 }
 
-// Join wraps a caller-opened *sql.Tx so library users can post inside their own transaction.
+// Join wraps a caller-opened pgx.Tx or *sql.Tx so library users can post inside their own transaction.
 func (s *Store) Join(_ context.Context, external any) (storage.Tx, error) {
-	sqlTx, ok := external.(*sql.Tx)
-	if !ok || sqlTx == nil {
+	switch tx := external.(type) {
+	case *sql.Tx:
+		if tx == nil {
+			return nil, storage.ErrJoinUnsupported
+		}
+		return &pgTx{runner: &sqlTxRunner{tx: tx}, external: true}, nil
+	case pgx.Tx:
+		if tx == nil {
+			return nil, storage.ErrJoinUnsupported
+		}
+		return &pgTx{runner: &pgxTxRunner{tx: tx}, external: true}, nil
+	default:
 		return nil, storage.ErrJoinUnsupported
 	}
-	return &pgTx{tx: sqlTx, external: true}, nil
 }
 
+type txRunner interface {
+	exec(ctx context.Context, query string, args ...any) (int64, error)
+	queryRow(ctx context.Context, query string, args ...any) rowScanner
+	commit(ctx context.Context) error
+	rollback(ctx context.Context) error
+}
+
+type sqlTxRunner struct {
+	tx *sql.Tx
+}
+
+func (r *sqlTxRunner) exec(ctx context.Context, query string, args ...any) (int64, error) {
+	res, err := r.tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+func (r *sqlTxRunner) queryRow(ctx context.Context, query string, args ...any) rowScanner {
+	return r.tx.QueryRowContext(ctx, query, args...)
+}
+
+func (r *sqlTxRunner) commit(_ context.Context) error   { return r.tx.Commit() }
+func (r *sqlTxRunner) rollback(_ context.Context) error { return r.tx.Rollback() }
+
+type pgxTxRunner struct {
+	tx pgx.Tx
+}
+
+func (r *pgxTxRunner) exec(ctx context.Context, query string, args ...any) (int64, error) {
+	tag, err := r.tx.Exec(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (r *pgxTxRunner) queryRow(ctx context.Context, query string, args ...any) rowScanner {
+	return r.tx.QueryRow(ctx, query, args...)
+}
+
+func (r *pgxTxRunner) commit(ctx context.Context) error   { return r.tx.Commit(ctx) }
+func (r *pgxTxRunner) rollback(ctx context.Context) error { return r.tx.Rollback(ctx) }
+
 type pgTx struct {
-	tx       *sql.Tx
+	runner   txRunner
 	external bool
 }
 
@@ -91,7 +307,7 @@ func (t *pgTx) LockBalances(ctx context.Context, ids []core.AccountID) ([]core.B
 			continue
 		}
 		seen[id] = true
-		row := t.tx.QueryRowContext(ctx, `
+		row := t.runner.queryRow(ctx, `
 			SELECT b.account_id, a.asset, b.posted_debits::text, b.posted_credits::text,
 			       b.pending_debits::text, b.pending_credits::text, b.version
 			FROM ledger.balances b
@@ -100,7 +316,7 @@ func (t *pgTx) LockBalances(ctx context.Context, ids []core.AccountID) ([]core.B
 			FOR UPDATE OF b`, string(id))
 		b, err := scanBalance(row)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
+			if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
 				return nil, fmt.Errorf("%w: account %s", storage.ErrNotFound, id)
 			}
 			return nil, err
@@ -113,7 +329,7 @@ func (t *pgTx) LockBalances(ctx context.Context, ids []core.AccountID) ([]core.B
 func (t *pgTx) ClaimIdempotency(ctx context.Context, recs []storage.IdemRecord) ([]storage.IdemRecord, error) {
 	var existing []storage.IdemRecord
 	for _, r := range recs {
-		res, err := t.tx.ExecContext(ctx, `
+		affected, err := t.runner.exec(ctx, `
 			INSERT INTO ledger.idempotency (ledger_id, key, request_hash, tx_id, created_at)
 			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (ledger_id, key) DO NOTHING`,
@@ -121,11 +337,10 @@ func (t *pgTx) ClaimIdempotency(ctx context.Context, recs []storage.IdemRecord) 
 		if err != nil {
 			return nil, err
 		}
-		affected, _ := res.RowsAffected()
 		if affected == 0 {
 			var ex storage.IdemRecord
 			var lID, txID string
-			err := t.tx.QueryRowContext(ctx, `
+			err := t.runner.queryRow(ctx, `
 				SELECT ledger_id, key, request_hash, tx_id, created_at
 				FROM ledger.idempotency WHERE ledger_id = $1 AND key = $2`,
 				string(r.Ledger), r.Key).Scan(&lID, &ex.Key, &ex.RequestHash, &txID, &ex.CreatedAt)
@@ -150,7 +365,7 @@ func (t *pgTx) InsertTransactions(ctx context.Context, txs []*core.Transaction) 
 		if err != nil {
 			return err
 		}
-		_, err = t.tx.ExecContext(ctx, `
+		_, err = t.runner.exec(ctx, `
 			INSERT INTO ledger.transactions
 			(id, ledger_id, kind, pending, postings, effective_at, committed_at, expires_at, reverses, pending_id, idempotency_key, metadata)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
@@ -162,7 +377,7 @@ func (t *pgTx) InsertTransactions(ctx context.Context, txs []*core.Transaction) 
 		}
 		rev := make([]money.Amount, len(tx.Postings))
 		revJSON, _ := json.Marshal(rev)
-		_, err = t.tx.ExecContext(ctx, `
+		_, err = t.runner.exec(ctx, `
 			INSERT INTO ledger.tx_state (tx_id, status, reversed)
 			VALUES ($1, $2, $3)
 			ON CONFLICT (tx_id) DO NOTHING`,
@@ -181,7 +396,7 @@ func (t *pgTx) InsertEntries(ctx context.Context, es []core.Entry) error {
 			s := e.PostedAfter.String()
 			postedAfter = &s
 		}
-		_, err := t.tx.ExecContext(ctx, `
+		_, err := t.runner.exec(ctx, `
 			INSERT INTO ledger.entries
 			(tx_id, posting_index, side, account_id, amount, posted_after, version, effective_at, committed_at)
 			VALUES ($1, $2, $3, $4, $5::numeric, $6::numeric, $7, $8, $9)`,
@@ -199,11 +414,11 @@ func (t *pgTx) GetTxStates(ctx context.Context, ids []core.TransactionID) (map[c
 	for _, id := range ids {
 		var status int16
 		var revBytes []byte
-		err := t.tx.QueryRowContext(ctx, `
+		err := t.runner.queryRow(ctx, `
 			SELECT status, reversed FROM ledger.tx_state WHERE tx_id = $1 FOR UPDATE`, string(id)).
 			Scan(&status, &revBytes)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
+			if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
 				return nil, fmt.Errorf("%w: tx_state %s", storage.ErrNotFound, id)
 			}
 			return nil, err
@@ -227,7 +442,7 @@ func (t *pgTx) SetTxState(ctx context.Context, st []storage.TxState) error {
 		if err != nil {
 			return err
 		}
-		_, err = t.tx.ExecContext(ctx, `
+		_, err = t.runner.exec(ctx, `
 			INSERT INTO ledger.tx_state (tx_id, status, reversed)
 			VALUES ($1, $2, $3)
 			ON CONFLICT (tx_id) DO UPDATE SET status = EXCLUDED.status, reversed = EXCLUDED.reversed`,
@@ -241,7 +456,7 @@ func (t *pgTx) SetTxState(ctx context.Context, st []storage.TxState) error {
 
 func (t *pgTx) WriteBalances(ctx context.Context, bs []core.Balance) error {
 	for _, b := range bs {
-		_, err := t.tx.ExecContext(ctx, `
+		_, err := t.runner.exec(ctx, `
 			UPDATE ledger.balances
 			SET posted_debits = $2::numeric,
 			    posted_credits = $3::numeric,
@@ -261,7 +476,7 @@ func (t *pgTx) WriteBalances(ctx context.Context, bs []core.Balance) error {
 
 func (t *pgTx) AppendOutbox(ctx context.Context, evs []events.Event) error {
 	for _, ev := range evs {
-		_, err := t.tx.ExecContext(ctx, `
+		_, err := t.runner.exec(ctx, `
 			INSERT INTO ledger.outbox (event_id, ledger_id, type, payload, created_at)
 			VALUES ($1, $2, $3, $4, $5)`,
 			ev.ID, string(ev.Ledger), ev.Type, []byte(ev.Payload), ev.CreatedAt)
@@ -272,19 +487,19 @@ func (t *pgTx) AppendOutbox(ctx context.Context, evs []events.Event) error {
 	return nil
 }
 
-func (t *pgTx) Commit(_ context.Context) error {
+func (t *pgTx) Commit(ctx context.Context) error {
 	if t.external {
 		// Caller owns the transaction lifecycle when using WithinTx / Join
 		return nil
 	}
-	return t.tx.Commit()
+	return t.runner.commit(ctx)
 }
 
-func (t *pgTx) Rollback(_ context.Context) error {
+func (t *pgTx) Rollback(ctx context.Context) error {
 	if t.external {
 		return nil
 	}
-	return t.tx.Rollback()
+	return t.runner.rollback(ctx)
 }
 
 // --- Admin methods ---
@@ -437,6 +652,35 @@ func (s *Store) PruneIdempotency(ctx context.Context, before time.Time) (int, er
 	}
 	n, _ := res.RowsAffected()
 	return int(n), nil
+}
+
+func (s *Store) ExecModuleMigration(ctx context.Context, moduleName, migrationID, sqlText string) error {
+	var exists int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM ledger.module_migrations WHERE module = $1 AND migration_id = $2`,
+		moduleName, migrationID).Scan(&exists)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if strings.TrimSpace(sqlText) != "" {
+		if _, err := tx.ExecContext(ctx, sqlText); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO ledger.module_migrations (module, migration_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+		moduleName, migrationID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // --- Reader methods ---
@@ -1003,6 +1247,27 @@ func (s *Store) PruneDelivered(ctx context.Context, before time.Time) (int, erro
 
 // --- Journal methods ---
 
+func (s *Store) TryAdvisoryLock(ctx context.Context, lockKey string) (func(), bool, error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	var acquired bool
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(hashtext($1)::bigint)`, lockKey).Scan(&acquired); err != nil {
+		_ = conn.Close()
+		return nil, false, err
+	}
+	if !acquired {
+		_ = conn.Close()
+		return nil, false, nil
+	}
+	unlock := func() {
+		_, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(hashtext($1)::bigint)`, lockKey)
+		_ = conn.Close()
+	}
+	return unlock, true, nil
+}
+
 func (s *Store) UnsealedTransactions(ctx context.Context, l core.LedgerID, limit int) ([]*core.Transaction, error) {
 	if limit <= 0 {
 		limit = 500
@@ -1248,6 +1513,10 @@ func mapPgErr(err error) error {
 	}
 	if strings.Contains(msg, "foreign key") || strings.Contains(msg, "23503") {
 		return fmt.Errorf("%w: %v", storage.ErrNotFound, err)
+	}
+	if strings.Contains(msg, "55P03") || strings.Contains(msg, "40P01") || strings.Contains(msg, "40001") ||
+		strings.Contains(msg, "lock timeout") || strings.Contains(msg, "deadlock") {
+		return core.NewError(core.CodeLockTimeout, msg, map[string]any{"cause": msg})
 	}
 	return err
 }

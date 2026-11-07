@@ -31,17 +31,25 @@ type Options struct {
 	Duration    time.Duration // benchmark duration (default 2s)
 }
 
-// Summary reports benchmark throughput and latency percentiles.
+// Summary reports benchmark throughput, latency percentiles, and abort rate (RFC Section 13).
 type Summary struct {
 	Workload     string        `json:"workload"`
 	Mode         string        `json:"mode"`
 	Duration     time.Duration `json:"duration"`
 	CommittedOps uint64        `json:"committed_ops"`
 	RejectedOps  uint64        `json:"rejected_ops"`
+	AbortRate    float64       `json:"abort_rate"`
 	TPS          float64       `json:"tps"`
 	P50          time.Duration `json:"p50"`
+	P95          time.Duration `json:"p95"`
 	P99          time.Duration `json:"p99"`
 	P999         time.Duration `json:"p999"`
+}
+
+// String formats Summary as a compact report line.
+func (s *Summary) String() string {
+	return fmt.Sprintf("workload=%s mode=%s tps=%.1f p50=%s p95=%s p99=%s p999=%s committed=%d rejected=%d abort_rate=%.4f",
+		s.Workload, s.Mode, s.TPS, s.P50, s.P95, s.P99, s.P999, s.CommittedOps, s.RejectedOps, s.AbortRate)
 }
 
 // Run executes the specified workload and mode and returns its Summary.
@@ -294,22 +302,30 @@ func Run(ctx context.Context, opts Options) (*Summary, error) {
 	totalDur := time.Since(start)
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 
-	var p50, p99, p999 time.Duration
+	var p50, p95, p99, p999 time.Duration
 	if n := len(latencies); n > 0 {
 		p50 = latencies[n*50/100]
+		p95 = latencies[n*95/100]
 		p99 = latencies[n*99/100]
 		p999 = latencies[n*999/1000]
 	}
 
 	comm := committed.Load()
+	rej := rejected.Load()
+	var abortRate float64
+	if total := comm + rej; total > 0 {
+		abortRate = float64(rej) / float64(total)
+	}
 	return &Summary{
 		Workload:     opts.Workload,
 		Mode:         opts.Mode,
 		Duration:     totalDur,
 		CommittedOps: comm,
-		RejectedOps:  rejected.Load(),
+		RejectedOps:  rej,
+		AbortRate:    abortRate,
 		TPS:          float64(comm) / totalDur.Seconds(),
 		P50:          p50,
+		P95:          p95,
 		P99:          p99,
 		P999:         p999,
 	}, nil

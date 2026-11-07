@@ -125,8 +125,6 @@ func (a Amount) Add(b Amount) (Amount, error) {
 	lo, carry := bits.Add64(a.lo, b.lo, 0)
 	uHi, _ := bits.Add64(uint64(a.hi), uint64(b.hi), carry)
 	hi := int64(uHi)
-	// Signed overflow occurs if and only if a and b have the same sign,
-	// and the result has the opposite sign.
 	if (a.hi^b.hi) >= 0 && (a.hi^hi) < 0 {
 		return Zero, ErrOverflow
 	}
@@ -138,7 +136,6 @@ func (a Amount) Sub(b Amount) (Amount, error) {
 	lo, borrow := bits.Sub64(a.lo, b.lo, 0)
 	uHi, _ := bits.Sub64(uint64(a.hi), uint64(b.hi), borrow)
 	hi := int64(uHi)
-	// Signed overflow occurs if a and b have different signs and the result sign != a's sign.
 	if (a.hi^b.hi) < 0 && (a.hi^hi) < 0 {
 		return Zero, ErrOverflow
 	}
@@ -172,22 +169,15 @@ func (a Amount) Int64() (int64, bool) {
 	return 0, false
 }
 
-// BigInt converts Amount to a *big.Int.
+// BigInt converts Amount to a *big.Int (for compatibility with external callers).
 func (a Amount) BigInt() *big.Int {
 	if a.IsZero() {
 		return big.NewInt(0)
 	}
-	neg := a.hi < 0
-	uHi := uint64(a.hi)
-	uLo := a.lo
-	if neg {
-		var borrow uint64
-		uLo, borrow = bits.Sub64(0, uLo, 0)
-		uHi, _ = bits.Sub64(0, uHi, borrow)
-	}
-	z := new(big.Int).SetUint64(uHi)
+	u, neg := absU128(a)
+	z := new(big.Int).SetUint64(u.hi)
 	z.Lsh(z, 64)
-	z.Or(z, new(big.Int).SetUint64(uLo))
+	z.Or(z, new(big.Int).SetUint64(u.lo))
 	if neg {
 		z.Neg(z)
 	}
@@ -204,7 +194,6 @@ func FromBigInt(b *big.Int) (Amount, error) {
 	if abs.BitLen() > 128 {
 		return Zero, ErrOverflow
 	}
-	// Extract low 64 and high 64 bits of magnitude
 	var uLo, uHi uint64
 	words := abs.Bits()
 	if bits.UintSize == 64 {
@@ -218,29 +207,15 @@ func FromBigInt(b *big.Int) (Amount, error) {
 			return Zero, ErrOverflow
 		}
 	} else {
-		// 32-bit fallback
 		mask64 := new(big.Int).SetUint64(math.MaxUint64)
 		uLo = new(big.Int).And(abs, mask64).Uint64()
 		uHi = new(big.Int).Rsh(abs, 64).Uint64()
 	}
-
-	if !neg {
-		if uHi > math.MaxInt64 {
-			return Zero, ErrOverflow
-		}
-		return Amount{hi: int64(uHi), lo: uLo}, nil
-	}
-	// Negative: magnitude up to 2^127 is valid (-2^127 has uHi == 1<<63 && uLo == 0)
-	if uHi > (1<<63) || (uHi == (1<<63) && uLo > 0) {
-		return Zero, ErrOverflow
-	}
-	var borrow uint64
-	lo, borrow := bits.Sub64(0, uLo, 0)
-	hiU, _ := bits.Sub64(0, uHi, borrow)
-	return Amount{hi: int64(hiU), lo: lo}, nil
+	return fromSignedU128(u128{hi: uHi, lo: uLo}, neg)
 }
 
-// String returns the canonical base-10 string of minor units (e.g. "1001" or "-45").
+// String returns the canonical base-10 string of minor units (e.g. "1001" or "-45")
+// using stack-allocated 128-bit division without math/big allocations.
 func (a Amount) String() string {
 	if a.hi == 0 {
 		return strconv.FormatUint(a.lo, 10)
@@ -248,34 +223,108 @@ func (a Amount) String() string {
 	if v, ok := a.Int64(); ok {
 		return strconv.FormatInt(v, 10)
 	}
-	return a.BigInt().String()
+	u, neg := absU128(a)
+	// Divide u by 10^19 up to twice: max uint128 is ~3.4e38 < 10^39
+	const base19 = 10_000_000_000_000_000_000 // 10^19
+	q1Hi, r1 := bits.Div64(0, u.hi, base19)
+	q1Lo, chunk0 := bits.Div64(r1, u.lo, base19)
+
+	var buf [44]byte
+	pos := len(buf)
+
+	if q1Hi == 0 && q1Lo == 0 {
+		pos = writeUintBackward(buf[:], pos, chunk0, 0)
+	} else {
+		// Format chunk0 padded to 19 digits
+		pos = writeUintBackward(buf[:], pos, chunk0, 19)
+		if q1Hi == 0 && q1Lo < base19 {
+			pos = writeUintBackward(buf[:], pos, q1Lo, 0)
+		} else {
+			_, r2 := bits.Div64(0, q1Hi, base19)
+			chunk2, chunk1 := bits.Div64(r2, q1Lo, base19)
+			pos = writeUintBackward(buf[:], pos, chunk1, 19)
+			pos = writeUintBackward(buf[:], pos, chunk2, 0)
+		}
+	}
+	if neg {
+		pos--
+		buf[pos] = '-'
+	}
+	return string(buf[pos:])
 }
 
-// ParseMinor parses a canonical base-10 integer string of minor units (e.g., "1001").
+func writeUintBackward(buf []byte, pos int, v uint64, minWidth int) int {
+	startPos := pos
+	for v > 0 {
+		pos--
+		buf[pos] = byte('0' + (v % 10))
+		v /= 10
+	}
+	written := startPos - pos
+	if minWidth == 0 && written == 0 {
+		pos--
+		buf[pos] = '0'
+		return pos
+	}
+	for written < minWidth {
+		pos--
+		buf[pos] = '0'
+		written++
+	}
+	return pos
+}
+
+// ParseMinor parses a canonical base-10 integer string of minor units (e.g., "1001")
+// with zero heap allocations.
 func ParseMinor(s string) (Amount, error) {
 	if s == "" {
 		return Zero, ErrInvalidAmount
 	}
+	neg := false
 	start := 0
-	if s[0] == '-' || s[0] == '+' {
+	if s[0] == '-' {
+		neg = true
+		start = 1
+	} else if s[0] == '+' {
 		start = 1
 	}
 	if start == len(s) {
 		return Zero, ErrInvalidAmount
 	}
+	// Fast path for <= 18 digits
+	if len(s)-start <= 18 {
+		var acc uint64
+		for i := start; i < len(s); i++ {
+			c := s[i]
+			if c < '0' || c > '9' {
+				return Zero, ErrInvalidAmount
+			}
+			acc = acc*10 + uint64(c-'0')
+		}
+		return fromSignedU128(u128{hi: 0, lo: acc}, neg)
+	}
+
+	var u u128
 	for i := start; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
+		c := s[i]
+		if c < '0' || c > '9' {
 			return Zero, ErrInvalidAmount
 		}
+		digit := uint64(c - '0')
+		// u = u * 10 + digit
+		p0Hi, p0Lo := bits.Mul64(u.lo, 10)
+		p1Hi, p1Lo := bits.Mul64(u.hi, 10)
+		if p1Hi != 0 {
+			return Zero, ErrOverflow
+		}
+		lo, c1 := bits.Add64(p0Lo, digit, 0)
+		hi, c2 := bits.Add64(p1Lo, p0Hi, c1)
+		if c2 != 0 {
+			return Zero, ErrOverflow
+		}
+		u = u128{hi: hi, lo: lo}
 	}
-	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return FromInt64(v), nil
-	}
-	z, ok := new(big.Int).SetString(s, 10)
-	if !ok {
-		return Zero, ErrInvalidAmount
-	}
-	return FromBigInt(z)
+	return fromSignedU128(u, neg)
 }
 
 // MarshalJSON encodes Amount as a JSON string of minor units.
@@ -395,22 +444,21 @@ func Parse(s string, a Asset) (Amount, error) {
 			ErrExtraPrecision, s, len(fracPart), a.ID(), a.Scale)
 	}
 
-	var b strings.Builder
+	var buf [80]byte
+	n := 0
 	if neg {
-		b.WriteByte('-')
+		buf[n] = '-'
+		n++
 	}
-	b.WriteString(wholePart)
-	b.WriteString(fracPart)
+	copy(buf[n:], wholePart)
+	n += len(wholePart)
+	copy(buf[n:], fracPart)
+	n += len(fracPart)
 	for i := len(fracPart); i < int(a.Scale); i++ {
-		b.WriteByte('0')
+		buf[n] = '0'
+		n++
 	}
-
-	amt, err := ParseMinor(b.String())
-	if err != nil {
-		return Zero, err
-	}
-	// "-0" normalises to 0
-	return amt, nil
+	return ParseMinor(string(buf[:n]))
 }
 
 // Format renders an Amount as a human-readable decimal string at the asset's scale (e.g. "10.01").
@@ -564,173 +612,102 @@ func ParseRoundingMode(s string) (RoundingMode, error) {
 	}
 }
 
-func pow10Big(exp uint8) *big.Int {
-	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(exp)), nil)
-}
-
-// divRound divides num by den (den > 0) using RoundingMode m, returning the rounded
-// quotient q and the exact remainder r = num - q*den.
-func divRound(num, den *big.Int, m RoundingMode) (q, rem *big.Int) {
-	if num.Sign() == 0 {
-		return big.NewInt(0), big.NewInt(0)
-	}
-	neg := num.Sign() < 0
-	absNum := new(big.Int).Abs(num)
-
-	// Truncated quotient and remainder on magnitudes: absNum = qAbs * den + rAbs
-	qAbs, rAbs := new(big.Int).QuoRem(absNum, den, new(big.Int))
-	if rAbs.Sign() == 0 {
-		if neg {
-			qAbs.Neg(qAbs)
-		}
-		return qAbs, big.NewInt(0)
-	}
-
-	// Determine whether to increment magnitude qAbs by 1
-	inc := false
-	// Compare 2 * rAbs with den
-	twoR := new(big.Int).Lsh(rAbs, 1)
-	cmpHalf := twoR.Cmp(den)
-
-	switch m {
-	case Down:
-		inc = false
-	case Up:
-		inc = true
-	case Floor:
-		inc = neg
-	case Ceil:
-		inc = !neg
-	case HalfUp:
-		inc = cmpHalf >= 0
-	case HalfEven:
-		if cmpHalf > 0 {
-			inc = true
-		} else if cmpHalf == 0 {
-			// Tie: round to even
-			if qAbs.Bit(0) == 1 {
-				inc = true
-			}
-		}
-	}
-
-	if inc {
-		qAbs.Add(qAbs, big.NewInt(1))
-	}
-	if neg {
-		qAbs.Neg(qAbs)
-	}
-	// Exact remainder: num - q * den
-	qDen := new(big.Int).Mul(qAbs, den)
-	rem = new(big.Int).Sub(num, qDen)
-	return qAbs, rem
-}
-
-// MulRate returns x * r rounded to x's scale using a 256-bit intermediate.
-// It also returns the remainder that rounding discarded, in units of 10^-r.Scale
-// (so x * r.Mantissa == result * 10^r.Scale + remainder).
+// MulRate returns x * r rounded to x's scale, using a stack-allocated 256-bit intermediate
+// with zero heap allocations. It also returns the remainder that rounding discarded,
+// in units of 10^-r.Scale (so x * r.Mantissa == result * 10^r.Scale + remainder).
 func MulRate(x Amount, r Rate, m RoundingMode) (result Amount, remainder Amount, err error) {
 	if r.Scale > MaxScale {
 		return Zero, Zero, fmt.Errorf("%w: scale %d exceeds max %d", ErrInvalidRate, r.Scale, MaxScale)
 	}
-	prod := new(big.Int).Mul(x.BigInt(), r.Mantissa.BigInt())
-	den := pow10Big(r.Scale)
-
-	qBig, remBig := divRound(prod, den, m)
-	resAmt, err := FromBigInt(qBig)
-	if err != nil {
-		return Zero, Zero, err
+	if x.IsZero() || r.Mantissa.IsZero() {
+		return Zero, Zero, nil
 	}
-	remAmt, err := FromBigInt(remBig)
-	if err != nil {
-		return Zero, Zero, err
-	}
-	return resAmt, remAmt, nil
+	uX, negX := absU128(x)
+	uM, negM := absU128(r.Mantissa)
+	prod := mul128(uX, uM)
+	den := pow10Table[r.Scale]
+	return divRound256(prod, negX != negM, den, m)
 }
 
-// Rescale moves an amount between scales of the same currency (e.g. USD/6 -> USD/2).
+// Rescale moves an amount between scales of the same currency (e.g. USD/6 -> USD/2)
+// using stack-allocated 256-bit arithmetic with zero heap allocations.
 // When scaling down (from > to), remainder is returned in the source (`from`) scale
 // so that x == result * 10^(from-to) + remainder.
 func Rescale(x Amount, from, to uint8, m RoundingMode) (result, remainder Amount, err error) {
 	if from > MaxScale || to > MaxScale {
 		return Zero, Zero, ErrInvalidAsset
 	}
-	if from == to {
+	if from == to || x.IsZero() {
 		return x, Zero, nil
 	}
+	uX, neg := absU128(x)
 	if to > from {
-		factor := pow10Big(to - from)
-		scaled := new(big.Int).Mul(x.BigInt(), factor)
-		resAmt, err := FromBigInt(scaled)
+		factor := pow10Table[to-from]
+		prod := mul128(uX, factor)
+		resAmt, err := fromSignedU256(prod, neg)
 		if err != nil {
 			return Zero, Zero, err
 		}
 		return resAmt, Zero, nil
 	}
 	// Scaling down: from > to
-	den := pow10Big(from - to)
-	qBig, remBig := divRound(x.BigInt(), den, m)
-	resAmt, err := FromBigInt(qBig)
-	if err != nil {
-		return Zero, Zero, err
-	}
-	remAmt, err := FromBigInt(remBig)
-	if err != nil {
-		return Zero, Zero, err
-	}
-	return resAmt, remAmt, nil
+	den := pow10Table[from-to]
+	prod := u256{w0: uX.lo, w1: uX.hi}
+	return divRound256(prod, neg, den, m)
 }
 
-// Allocate splits total by weights using the largest-remainder method.
-// Parts always sum to total; ties go to the lowest index so results are deterministic.
+// Allocate splits total by weights using the largest-remainder method with stack-allocated
+// 256-bit arithmetic. Parts always sum to total; ties go to the lowest index.
 func Allocate(total Amount, weights []uint64) ([]Amount, error) {
 	if len(weights) == 0 {
 		return nil, ErrInvalidWeights
 	}
-	weightSum := new(big.Int)
+	var weightSum u128
 	for _, w := range weights {
-		weightSum.Add(weightSum, new(big.Int).SetUint64(w))
+		lo, c := bits.Add64(weightSum.lo, w, 0)
+		hi := weightSum.hi + c
+		weightSum = u128{hi: hi, lo: lo}
 	}
-	if weightSum.Sign() <= 0 {
+	if weightSum.isZero() {
 		return nil, ErrInvalidWeights
 	}
 
-	neg := total.IsNegative()
-	absTotal := new(big.Int).Abs(total.BigInt())
+	absTotal, neg := absU128(total)
 
 	type part struct {
-		idx       int
-		quotient  *big.Int
-		remainder *big.Int
+		quotient  u128
+		remainder u128
 	}
 
 	parts := make([]part, len(weights))
-	allocatedSum := new(big.Int)
+	var allocatedSum u128
 
 	for i, w := range weights {
-		num := new(big.Int).Mul(absTotal, new(big.Int).SetUint64(w))
-		q, rem := new(big.Int).QuoRem(num, weightSum, new(big.Int))
+		num := mul128(absTotal, u128{hi: 0, lo: w})
+		q256, rem := divRem256(num, weightSum)
+		q := u128{hi: q256.w1, lo: q256.w0}
 		parts[i] = part{
-			idx:       i,
 			quotient:  q,
 			remainder: rem,
 		}
-		allocatedSum.Add(allocatedSum, q)
+		lo, c := bits.Add64(allocatedSum.lo, q.lo, 0)
+		hi := allocatedSum.hi + q.hi + c
+		allocatedSum = u128{hi: hi, lo: lo}
 	}
 
-	leftover := new(big.Int).Sub(absTotal, allocatedSum).Int64()
-	// Sort indices by largest remainder, breaking ties by lowest index
+	leftoverLo, _ := bits.Sub64(absTotal.lo, allocatedSum.lo, 0)
+	leftover := int(leftoverLo)
+
 	order := make([]int, len(weights))
 	for i := range order {
 		order[i] = i
 	}
-	// Deterministic insertion sort (typically small N) or stable sort
 	for i := 1; i < len(order); i++ {
 		cur := order[i]
 		j := i - 1
 		for j >= 0 {
 			prev := order[j]
-			cmp := parts[cur].remainder.Cmp(parts[prev].remainder)
+			cmp := parts[cur].remainder.cmp(parts[prev].remainder)
 			if cmp > 0 || (cmp == 0 && cur < prev) {
 				order[j+1] = order[j]
 				j--
@@ -741,19 +718,16 @@ func Allocate(total Amount, weights []uint64) ([]Amount, error) {
 		order[j+1] = cur
 	}
 
-	one := big.NewInt(1)
-	for i := int64(0); i < leftover; i++ {
+	for i := 0; i < leftover; i++ {
 		targetIdx := order[i]
-		parts[targetIdx].quotient.Add(parts[targetIdx].quotient, one)
+		lo, c := bits.Add64(parts[targetIdx].quotient.lo, 1, 0)
+		hi := parts[targetIdx].quotient.hi + c
+		parts[targetIdx].quotient = u128{hi: hi, lo: lo}
 	}
 
 	out := make([]Amount, len(weights))
 	for i := range parts {
-		val := parts[i].quotient
-		if neg && val.Sign() > 0 {
-			val = new(big.Int).Neg(val)
-		}
-		amt, err := FromBigInt(val)
+		amt, err := fromSignedU128(parts[i].quotient, neg)
 		if err != nil {
 			return nil, err
 		}
