@@ -1,0 +1,331 @@
+openapi: 3.1.0
+info:
+  title: go-finjournal REST API
+  version: 1.0.0
+  description: Double-entry financial journal and ledger engine REST contract (RFC-0001).
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+paths:
+  /v1/ledgers:
+    post:
+      operationId: createLedger
+      summary: Create a ledger
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, name]
+              properties:
+                id: { type: string }
+                name: { type: string }
+                metadata: { $ref: '#/components/schemas/Metadata' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ledger' }
+  /v1/ledgers/{ledger}/assets:
+    post:
+      operationId: registerAsset
+      summary: Register an asset (e.g. USD/2)
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id: { type: string, example: USD/2 }
+                code: { type: string, example: USD }
+                scale: { type: integer, minimum: 0, maximum: 30 }
+      responses:
+        '201':
+          description: Asset registered
+  /v1/ledgers/{ledger}/holders:
+    post:
+      operationId: createHolder
+      summary: Create an account holder
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountHolder' }
+      responses:
+        '201':
+          description: Created
+  /v1/ledgers/{ledger}/holders/{id}/balances:
+    get:
+      operationId: getHolderBalances
+      summary: Per-asset totals across a holder's accounts
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: report_in, in: query, required: false, schema: { type: string, example: USD/2 } }
+      responses:
+        '200':
+          description: Holder balances
+  /v1/ledgers/{ledger}/accounts:
+    post:
+      operationId: createAccount
+      summary: Create an account
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Account' }
+      responses:
+        '201':
+          description: Created
+  /v1/ledgers/{ledger}/accounts/{id}:
+    patch:
+      operationId: updateAccount
+      summary: Change account status, limits, or metadata
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: { type: string, enum: [open, frozen, closed] }
+                limits: { $ref: '#/components/schemas/Limits' }
+                metadata: { $ref: '#/components/schemas/Metadata' }
+      responses:
+        '200':
+          description: Updated
+  /v1/ledgers/{ledger}/accounts/{id}/balance:
+    get:
+      operationId: getAccountBalance
+      summary: Current or point-in-time balance
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: at, in: query, required: false, schema: { type: string, format: date-time } }
+      responses:
+        '200':
+          description: Balance
+  /v1/ledgers/{ledger}/accounts/{id}/entries:
+    get:
+      operationId: getAccountEntries
+      summary: Entry history, newest first
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: cursor, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer } }
+      responses:
+        '200':
+          description: Paginated entries
+  /v1/ledgers/{ledger}/transactions:
+    post:
+      operationId: postTransaction
+      summary: Post a transaction intent
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Intent' }
+      responses:
+        '201':
+          description: Committed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transaction' }
+        '200':
+          description: Idempotent replay of an earlier commit
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/ledgers/{ledger}/transactions/{id}:
+    get:
+      operationId: getTransaction
+      summary: Read a transaction
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Transaction
+  /v1/ledgers/{ledger}/transactions/{id}/post:
+    post:
+      operationId: settleHold
+      summary: Settle a pending hold transaction, fully or partially
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Hold settled
+  /v1/ledgers/{ledger}/transactions/{id}/void:
+    post:
+      operationId: voidHold
+      summary: Release a pending hold
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Hold voided
+  /v1/ledgers/{ledger}/transactions/{id}/reverse:
+    post:
+      operationId: reverseTransaction
+      summary: Reverse a posted transaction fully or partially
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: Reversal committed
+  /v1/ledgers/{ledger}/events:
+    get:
+      operationId: getEvents
+      summary: Event feed (JSON or Server-Sent Events)
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - { name: after, in: query, required: false, schema: { type: integer } }
+      responses:
+        '200':
+          description: Events
+  /v1/ledgers/{ledger}/journal/checkpoints:
+    get:
+      operationId: getCheckpoints
+      summary: Hash-chain checkpoints
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+      responses:
+        '200':
+          description: Checkpoints
+  /v1/ledgers/{ledger}/periods/{start}/close:
+    post:
+      operationId: closePeriod
+      summary: Close an accounting period
+      parameters:
+        - $ref: '#/components/parameters/Ledger'
+        - { name: start, in: path, required: true, schema: { type: string, format: date-time } }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Period closed
+components:
+  parameters:
+    Ledger:
+      name: ledger
+      in: path
+      required: true
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, maxLength: 128 }
+  responses:
+    Error:
+      description: Structured error response
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [code, message]
+            properties:
+              code: { type: string }
+              message: { type: string }
+              details: { type: object }
+  schemas:
+    Amount:
+      type: string
+      pattern: '^[0-9]{1,38}$'
+      description: Minor units of the posting's asset.
+    Metadata:
+      type: object
+      additionalProperties: { type: string }
+      maxProperties: 64
+    Limits:
+      type: object
+      properties:
+        min: { $ref: '#/components/schemas/Amount' }
+        max: { $ref: '#/components/schemas/Amount' }
+    Ledger:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        metadata: { $ref: '#/components/schemas/Metadata' }
+        created_at: { type: string, format: date-time }
+    AccountHolder:
+      type: object
+      required: [kind, external_ref]
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        external_ref: { type: string }
+        metadata: { $ref: '#/components/schemas/Metadata' }
+    Account:
+      type: object
+      required: [code, asset, normal]
+      properties:
+        id: { type: string }
+        holder: { type: string }
+        code: { type: string }
+        asset: { type: string, example: USD/2 }
+        normal: { type: string, enum: [debit, credit] }
+        balance_mode: { type: string, enum: [locked, deferred] }
+        limits: { $ref: '#/components/schemas/Limits' }
+        status: { type: string, enum: [open, frozen, closed] }
+        metadata: { $ref: '#/components/schemas/Metadata' }
+    Posting:
+      type: object
+      required: [debit, credit, amount, asset]
+      properties:
+        debit:  { type: string, description: Account id or code }
+        credit: { type: string, description: Account id or code }
+        amount: { $ref: '#/components/schemas/Amount' }
+        asset:  { type: string, example: USD/2 }
+        source: { type: string }
+        memo:   { type: string, maxLength: 256 }
+    Intent:
+      type: object
+      required: [kind]
+      properties:
+        kind:         { type: string, example: card_capture }
+        postings:     { type: array, maxItems: 256, items: { $ref: '#/components/schemas/Posting' } }
+        params:       { type: object, additionalProperties: { type: string } }
+        pending:      { type: boolean, default: false }
+        expires_at:   { type: string, format: date-time }
+        effective_at: { type: string, format: date-time }
+        metadata:     { $ref: '#/components/schemas/Metadata' }
+    Transaction:
+      type: object
+      properties:
+        id:           { type: string }
+        ledger:       { type: string }
+        kind:         { type: string }
+        status:       { type: string, enum: [posted, pending, voided, expired] }
+        postings:     { type: array, items: { $ref: '#/components/schemas/Posting' } }
+        effective_at: { type: string, format: date-time }
+        committed_at: { type: string, format: date-time }
+        metadata:     { $ref: '#/components/schemas/Metadata' }
